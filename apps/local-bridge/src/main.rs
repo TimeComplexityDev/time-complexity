@@ -15,10 +15,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+mod dsp;
 
 // ---------------------------------------------------------------------------
 // Audio stream backend — mic (cpal) or file (symphonia)
@@ -122,6 +124,7 @@ struct AppState {
     session_id: Option<String>,
     audio_stream: SafeStream,
     sample_count: Arc<AtomicU64>,
+    pipeline: Arc<Mutex<dsp::DspPipeline>>,
     input_file: Option<PathBuf>,
     loop_playback: bool,
 }
@@ -219,7 +222,9 @@ fn find_input_config(
         .map_err(|e| format!("no default audio input config: {}", e))
 }
 
-fn start_mic_capture() -> Result<CaptureSession, String> {
+fn start_mic_capture(
+    pipeline: &Arc<Mutex<dsp::DspPipeline>>,
+) -> Result<CaptureSession, String> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -246,8 +251,12 @@ fn start_mic_capture() -> Result<CaptureSession, String> {
         eprintln!("mic error on '{}': {}", name, err);
     };
 
+    let pipe = pipeline.clone();
     let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         count.fetch_add(data.len() as u64, Ordering::Relaxed);
+        if let Ok(mut p) = pipe.lock() {
+            p.process_samples(data);
+        }
     };
 
     let stream = device
@@ -275,6 +284,7 @@ fn start_mic_capture() -> Result<CaptureSession, String> {
 fn start_file_capture(
     path: &std::path::Path,
     loop_playback: bool,
+    pipeline: &Arc<Mutex<dsp::DspPipeline>>,
 ) -> Result<CaptureSession, String> {
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::formats::FormatOptions;
@@ -321,6 +331,7 @@ fn start_file_capture(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let flag = stop_flag.clone();
     let path = path.to_path_buf();
+    let pipe = pipeline.clone();
 
     let join_handle = std::thread::spawn(move || {
         let _ = play_file(
@@ -331,6 +342,7 @@ fn start_file_capture(
             track_id,
             &count,
             &flag,
+            &pipe,
         );
     });
 
@@ -355,7 +367,9 @@ fn play_file(
     track_id: u32,
     sample_count: &AtomicU64,
     stop_flag: &AtomicBool,
+    pipeline: &Arc<Mutex<dsp::DspPipeline>>,
 ) -> Result<(), String> {
+    use symphonia::core::audio::SampleBuffer;
 
     loop {
         loop {
@@ -373,6 +387,25 @@ fn play_file(
                         let frames = decoded.frames() as u64;
                         let channels = decoded.spec().channels.count() as u64;
                         sample_count.fetch_add(frames * channels, Ordering::Relaxed);
+
+                        // Convert to interleaved f32 samples for the DSP pipeline
+                        let spec = *decoded.spec();
+                        let mut buf = SampleBuffer::<f32>::new(frames, spec);
+                        buf.copy_interleaved_ref(decoded);
+                        let samples = buf.samples();
+
+                        // Mono-mix: average channels if needed
+                        if channels > 1 {
+                            let mono: Vec<f32> = samples
+                                .chunks(channels as usize)
+                                .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
+                                .collect();
+                            if let Ok(mut p) = pipeline.lock() {
+                                p.process_samples(&mono);
+                            }
+                        } else if let Ok(mut p) = pipeline.lock() {
+                            p.process_samples(samples);
+                        }
                     }
                 }
                 Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
@@ -490,16 +523,18 @@ async fn start_handler(
 
     let capture = {
         let s = state.read().await;
+        let pipe = s.pipeline.clone();
         if let Some(path) = &s.input_file {
-            start_file_capture(path, s.loop_playback)
+            start_file_capture(path, s.loop_playback, &pipe)
         } else {
-            start_mic_capture()
+            start_mic_capture(&pipe)
         }
     };
 
     let mut s = state.write().await;
     match capture {
         Ok(session) => {
+            s.pipeline.lock().unwrap().set_sample_rate(session.sample_rate as f64);
             s.session_id = Some(Uuid::new_v4().to_string());
             s.device.device_name = session.device_name;
             s.device.sample_rate = session.sample_rate;
@@ -565,6 +600,7 @@ async fn main() -> Result<()> {
         session_id: None,
         audio_stream: SafeStream(None),
         sample_count: Arc::new(AtomicU64::new(0)),
+        pipeline: Arc::new(Mutex::new(dsp::DspPipeline::new(44100.0))),
         input_file: args.input_file.clone(),
         loop_playback: args.loop_playback,
     }));
