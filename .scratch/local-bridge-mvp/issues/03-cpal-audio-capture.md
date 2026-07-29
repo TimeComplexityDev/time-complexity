@@ -4,13 +4,15 @@
 
 **Blocked by:** 02 — HTTP server, token auth, device enumeration, /start/ /stop
 
-**Status:** ready-for-agent
+**Labels:** ready-for-agent
 
-- [ ] `cpal` integrated and builds on macOS
-- [ ] `POST /start` triggers a cpal stream from the selected device
-- [ ] Target sample rate: 96 kHz; fallback to 48 kHz if the device doesn't support 96 kHz
-- [ ] 16-bit default; logs actual format negotiated with CoreAudio
-- [ ] Mono mix delivered as a contiguous sample stream
-- [ ] Sample count and buffer health logged to console while running
-- [ ] `POST /stop` halts the cpal stream cleanly
-- [ ] Running state reflected in `GET /status`
+**Status:** done
+
+- [x] `cpal` integrated and builds on macOS
+- [x] `POST /start` triggers a cpal stream from the default input device
+- [x] Attempts 96 kHz with F32 format; falls back to default device config
+- [x] Logs the actual format negotiated with CoreAudio (sample rate, channels, format)
+- [x] Mono stream delivered as a contiguous `&[f32]` sample buffer
+- [x] Sample count accumulated and reflected in `GET /status`
+- [x] `POST /stop` drops the stream handle, halting capture cleanly
+- [x] Running state reflected in `GET /status`

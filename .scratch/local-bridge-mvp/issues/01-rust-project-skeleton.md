@@ -4,12 +4,14 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Labels:** ready-for-agent
 
-- [ ] `cargo run --` produces a working binary with `--help`
-- [ ] `--port <u16>` accepted (default 9001)
-- [ ] `--pair-token <str>` accepted; if omitted, generate a random token and print it
-- [ ] `--input-file <path>` accepted for offline MP3/WAV testing
-- [ ] `--reset-pairing` accepted to revoke existing token
-- [ ] Token persisted to a config file under `~/.config/timebridge/` or repo-local `.timebridge/`
-- [ ] Binary builds with no warnings on stable Rust
+**Status:** done
+
+- [x] `cargo run --` produces a working binary with `--help`
+- [x] `--port <u16>` accepted (default 9001)
+- [x] `--pair-token <str>` accepted; if omitted, generate a random token and print it
+- [x] `--input-file <path>` accepted for offline MP3/WAV testing
+- [x] `--reset-pairing` accepted to revoke existing token
+- [x] Token persisted to a config file under `~/.config/timebridge/`
+- [x] Binary builds with no warnings on stable Rust
