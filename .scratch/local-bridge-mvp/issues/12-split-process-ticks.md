@@ -6,7 +6,7 @@
 
 **Labels:** ready-for-agent
 
-**Status:** pending
+**Status:** done
 
 ## New interface
 

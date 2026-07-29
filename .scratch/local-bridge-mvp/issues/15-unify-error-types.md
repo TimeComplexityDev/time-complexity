@@ -11,7 +11,7 @@ This creates friction: adding a new handler requires deciding which error type t
 
 **Labels:** ready-for-agent
 
-**Status:** pending
+**Status:** done
 
 ## Proposed design
 
