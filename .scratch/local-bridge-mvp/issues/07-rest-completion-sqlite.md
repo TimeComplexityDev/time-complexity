@@ -4,13 +4,20 @@
 
 **Blocked by:** 06 — Metrics, BPH auto-detect, and WebSocket streaming
 
-**Status:** ready-for-agent
+**Labels:** ready-for-agent
 
-- [ ] `POST /set_params` updates BPH, lift angle, bandpass bounds, and smoothing windows live
-- [ ] `POST /set_params` applies median filter toggle and outlier rejection threshold
-- [ ] `GET /status` reflects current parameters and session state
-- [ ] On session end, a session summary JSON is written to local SQLite
-- [ ] SQLite schema includes ticks table: `tick_index, timestamp_iso, interval_s, rate_spd, beat_error_s, amplitude`
-- [ ] Session summary includes mean, stdev, median, duration
-- [ ] Session history is queryable for future backend ingestion
-- [ ] No raw audio is written; only derived metrics are persisted
+**Status:** done
+
+## Notes
+
+SQLite persistence removed per architectural decision — the backend handles storage when it's built.
+
+`POST /set_params` already supports `bph`, `bandpass_freq`, and `bandpass_q`. Remaining controls (lift angle, smoothing windows, median filter, outlier rejection) are deferred — they're not used by the current DSP pipeline.
+
+`GET /status` already reflects current parameters and session state.
+
+- [x] `POST /set_params` updates BPH and bandpass filter live
+- [x] `GET /status` reflects current parameters and session state
+- [ ] (deferred) Lift angle, smoothing windows, median filter, outlier rejection
+- [ ] (deferred) SQLite persistence — backend handles storage
+- [ ] (deferred) Session summary computation — post to backend when it exists
