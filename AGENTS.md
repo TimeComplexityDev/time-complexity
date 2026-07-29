@@ -1,0 +1,20 @@
+# Agent Instructions
+
+- This repo uses kilo for agent-driven development.
+- Skills are located in `.agents/skills/` and are auto-discovered by kilo.
+- Use the available skills to guide your work (e.g., `/implement`, `/tdd`, `/code-review`).
+- Run typechecking and tests regularly. Commit your work to the current branch.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as local markdown files under `.scratch/<feature>/` in this repo. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Multi-context layout: root `CONTEXT-MAP.md` pointing to per-component `CONTEXT.md` files. See `docs/agents/domain.md`.

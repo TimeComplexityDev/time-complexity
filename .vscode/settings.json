@@ -1,0 +1,13 @@
+{
+  "json.schemaDownload.enable": true,
+  "json.schemas": [
+    {
+      "fileMatch": ["kilo.json", "kilo.jsonc"],
+      "url": "https://app.kilo.ai/config.json"
+    },
+    {
+      "fileMatch": ["model-schema.json"],
+      "url": "https://models.dev/model-schema.json"
+    }
+  ]
+}
