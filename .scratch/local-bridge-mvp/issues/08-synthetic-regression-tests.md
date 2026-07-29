@@ -1,16 +1,18 @@
-# 08 — Synthetic regression test suite
+# 08 — Synthetic regression and accuracy test suite
 
-**What to build:** A deterministic test suite that feeds synthetic audio through the DSP pipeline and asserts on the outputs.
+**What to build:** Extend the existing test suite with beat error assertions, jitter accuracy validation, amplitude scaling checks, and a `mechanical_watch_1.mp3` regression fixture.
 
-**Blocked by:** 05 — DSP pipeline: bandpass, envelope, peak detection with adaptive threshold
+**Blocked by:** 05 — DSP pipeline
 
-**Status:** ready-for-agent
+**Labels:** ready-for-agent
 
-- [ ] Synthetic click track generator produces a configurable BPH click train with known jitter
-- [ ] Click track fed through the full DSP pipeline
-- [ ] Assert: tick count within tolerance of expected count for a given duration
-- [ ] Assert: mean interval matches nominal interval within tolerance
-- [ ] Assert: beat error computed and within range for synthetic asymmetry
-- [ ] Assert: amplitude proxy scales with input click amplitude
+**Status:** pending
+
+## Merged from tickets 08 and 09
+
+- [ ] Assert beat error: feed a click train with known beat error (e.g. 1.2 ms) through the DSP, verify the measured beat error matches within tolerance
+- [ ] Assert amplitude scaling: verify that changing the click amplitude scales the detected amplitude proportionally
+- [ ] Add jitter parameter to `generate_test_watch.py`: each tick's interval deviates from the nominal by a Gaussian random amount (e.g. ±50 µs)
+- [ ] Assert parabolic interpolation accuracy: process a jittered click train, verify the tick-to-tick residual error is significantly below the raw integer-sample error
+- [ ] Add `mechanical_watch_1.mp3` regression test — feed the real recording through the DSP, assert tick count and mean interval match known-good values
 - [ ] Tests run in CI with no audio hardware required
-- [ ] A saved 10-second contact-mic buffer (real watch) used as a regression fixture
