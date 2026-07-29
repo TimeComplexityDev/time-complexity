@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query, State,
+    },
     http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -17,10 +20,12 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 mod dsp;
+mod metrics;
 
 // ---------------------------------------------------------------------------
 // Audio stream backend — mic (cpal) or file (symphonia)
@@ -102,6 +107,18 @@ struct PairRequest {
     token: String,
 }
 
+#[derive(Deserialize)]
+struct SetParamsRequest {
+    bph: Option<u32>,
+    bandpass_freq: Option<f64>,
+    bandpass_q: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    token: Option<String>,
+}
+
 #[derive(Serialize, Clone)]
 struct DeviceConfig {
     device_name: String,
@@ -125,6 +142,7 @@ struct AppState {
     audio_stream: SafeStream,
     sample_count: Arc<AtomicU64>,
     pipeline: Arc<Mutex<dsp::DspPipeline>>,
+    bph_override: Option<u32>,
     input_file: Option<PathBuf>,
     loop_playback: bool,
 }
@@ -567,6 +585,101 @@ async fn stop_handler(
 }
 
 // ---------------------------------------------------------------------------
+// set_params handler
+// ---------------------------------------------------------------------------
+
+async fn set_params_handler(
+    State(state): State<SharedState>,
+    Json(body): Json<SetParamsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut s = state.write().await;
+    if let Some(bph) = body.bph {
+        s.bph_override = Some(bph);
+        s.device.bph = bph;
+    }
+    if let Some(freq) = body.bandpass_freq {
+        let q = body.bandpass_q.unwrap_or(0.4);
+        s.pipeline.lock().unwrap().set_bandpass(freq, q);
+    }
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket stream
+// ---------------------------------------------------------------------------
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<SharedState>,
+    Query(_query): Query<StreamQuery>,
+) -> impl IntoResponse {
+    let token = state.read().await.pair_token.clone();
+    // Allow auth via query param or Authorization header (checked by middleware)
+    ws.on_upgrade(move |socket| handle_socket(socket, state, token))
+}
+
+async fn handle_socket(mut socket: WebSocket, state: SharedState, _expected_token: String) {
+    let (sample_rate, session_id) = {
+        let s = state.read().await;
+        (s.device.sample_rate as f64, s.session_id.clone().unwrap_or_default())
+    };
+
+    let mut metrics = metrics::MetricsEngine::new(session_id, sample_rate, 28800);
+
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(bph) = cmd.get("bph").and_then(|v| v.as_u64()) {
+                                let mut s = state.write().await;
+                                s.bph_override = Some(bph as u32);
+                                s.device.bph = bph as u32;
+                                metrics.set_bph(bph as u32);
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                let bph_override = { state.read().await.bph_override };
+                let new_ticks = {
+                    let guard = state.read().await;
+                    let mut p = guard.pipeline.lock().unwrap();
+                    if let Some(bph) = bph_override {
+                        if p.detected_bph != bph {
+                            p.detected_bph = bph;
+                        }
+                    }
+                    p.ticks.clone()
+                };
+
+                let (tick_msgs, aggregate) = metrics.process_ticks(&new_ticks);
+
+                for msg in tick_msgs {
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(agg) = aggregate {
+                    if let Ok(json) = serde_json::to_string(&agg) {
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -601,6 +714,7 @@ async fn main() -> Result<()> {
         audio_stream: SafeStream(None),
         sample_count: Arc::new(AtomicU64::new(0)),
         pipeline: Arc::new(Mutex::new(dsp::DspPipeline::new(44100.0))),
+        bph_override: None,
         input_file: args.input_file.clone(),
         loop_playback: args.loop_playback,
     }));
@@ -609,13 +723,16 @@ async fn main() -> Result<()> {
         println!("File mode configured. Send POST /start to begin playback.");
     }
 
-    let public_routes = Router::new().route("/pair", post(pair_handler));
+    let public_routes = Router::new()
+        .route("/pair", post(pair_handler))
+        .route("/stream", get(ws_handler));
 
     let protected_routes = Router::new()
         .route("/devices", get(devices_handler))
         .route("/status", get(status_handler))
         .route("/start", post(start_handler))
         .route("/stop", post(stop_handler))
+        .route("/set_params", post(set_params_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
 
     let app = Router::new()
