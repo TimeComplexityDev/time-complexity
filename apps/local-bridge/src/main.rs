@@ -219,17 +219,11 @@ fn find_input_config(
         .map_err(|e| format!("no default audio input config: {}", e))
 }
 
-fn start_mic_capture(device_name: Option<&str>) -> Result<CaptureSession, String> {
+fn start_mic_capture() -> Result<CaptureSession, String> {
     let host = cpal::default_host();
-    let device = if let Some(name) = device_name {
-        host.input_devices()
-            .map_err(|e| format!("failed to enumerate devices: {}", e))?
-            .find(|d| d.name().ok().as_deref() == Some(name))
-            .ok_or_else(|| format!("device '{}' not found", name))?
-    } else {
-        host.default_input_device()
-            .ok_or_else(|| "no default input device found".to_string())?
-    };
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| "no default input device found".to_string())?;
     let actual_name = device.name().unwrap_or_else(|_| "unknown".to_string());
 
     let config = find_input_config(&device)?;
@@ -499,7 +493,7 @@ async fn start_handler(
         if let Some(path) = &s.input_file {
             start_file_capture(path, s.loop_playback)
         } else {
-            start_mic_capture(None)
+            start_mic_capture()
         }
     };
 
@@ -575,24 +569,8 @@ async fn main() -> Result<()> {
         loop_playback: args.loop_playback,
     }));
 
-    // Auto-start file playback if --input-file was provided
-    if let Some(path) = &args.input_file {
-        println!("File mode active: {}", path.display());
-        let capture = start_file_capture(path, args.loop_playback);
-        match capture {
-            Ok(session) => {
-                let mut s = state.write().await;
-                s.session_id = Some(Uuid::new_v4().to_string());
-                s.device.device_name = session.device_name;
-                s.device.sample_rate = session.sample_rate;
-                s.audio_stream = session.stream;
-                s.sample_count = session.sample_count;
-                println!("File playback started automatically (--input-file mode)");
-            }
-            Err(e) => {
-                eprintln!("Failed to start file capture: {}", e);
-            }
-        }
+    if args.input_file.is_some() {
+        println!("File mode configured. Send POST /start to begin playback.");
     }
 
     let public_routes = Router::new().route("/pair", post(pair_handler));

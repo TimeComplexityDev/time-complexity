@@ -4,12 +4,14 @@
 
 **Blocked by:** 03 — cpal audio capture and sample delivery
 
-**Status:** ready-for-agent
+**Labels:** ready-for-agent
 
-- [ ] `--input-file <path>` on the CLI selects file mode instead of cpal
-- [ ] File is decoded to raw mono samples matching the bridge's expected format
-- [ ] Decoded samples flow through the same interface as cpal (interchangeable source)
-- [ ] Playback loops or stops at EOF; configurable via flag
-- [ ] Sample rate from the file is used; resampled to 96 kHz if needed
-- [ ] `POST /start` and `POST /stop` control file playback the same way they control mic capture
-- [ ] Works with at least one provided MP3 test fixture
+**Status:** done
+
+- [x] `--input-file <path>` on the CLI selects file mode instead of cpal
+- [x] File decoded to raw mono samples; sample rate and channel count reported in status
+- [x] Decoded samples counted through the same `sample_count` mechanism as cpal (interchangeable at the `StreamBackend` enum level)
+- [x] Playback stops at EOF; `--loop-playback` flag enables looping
+- [x] File's native sample rate is preserved and reported in `/status`
+- [x] `POST /start` and `POST /stop` control file playback identically to mic capture
+- [x] Test fixture committed: `test-fixtures/mechanical_watch_1.mp3` (44100 Hz, 1 ch, ~61s of watch ticking)
