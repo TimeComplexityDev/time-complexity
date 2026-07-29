@@ -407,4 +407,126 @@ mod tests {
         // Should have produced some tick detections
         assert!(p.ticks.is_empty() || p.ticks.len() > 0);
     }
+
+    /// Generate a synthetic mechanical watch tick track.
+    ///
+    /// Simulates the acoustic impulse of an escapement at the given BPH with
+    /// optional rate drift and beat error. Each tick is a 5 kHz sine burst
+    /// with exponential decay, placed at the precise sample position given
+    /// by the drift/beat-error model.
+    ///
+    /// Parameters:
+    ///   - `bph`: beats per hour (e.g. 21600 → 6 Hz)
+    ///   - `drift_s_per_day`: rate error in seconds/day (positive = watch runs fast)
+    ///   - `beat_error_ms`: asymmetry between tic/tok in milliseconds
+    ///   - `sample_rate`: output sample rate in Hz
+    ///   - `duration_sec`: length of generated audio
+    ///   - `amplitude`: peak amplitude of each tick impulse
+    fn synthetic_click_train(
+        bph: u32,
+        drift_s_per_day: f64,
+        beat_error_ms: f64,
+        sample_rate: u32,
+        duration_sec: f64,
+        amplitude: f32,
+    ) -> Vec<f32> {
+        let total_samples = (sample_rate as f64 * duration_sec) as usize;
+        let mut audio = vec![0.0_f32; total_samples];
+
+        let beats_per_sec = bph as f64 / 3600.0;
+        let nominal_period = 1.0 / beats_per_sec;
+        let time_scale = 1.0 + (drift_s_per_day / 86400.0);
+        let actual_period = nominal_period * time_scale;
+        let beat_error_sec = beat_error_ms / 1000.0;
+
+        let mut current_time = 0.0;
+        let mut beat_count = 0u64;
+
+        while current_time < duration_sec {
+            let interval = if beat_count % 2 == 0 {
+                actual_period + beat_error_sec / 2.0
+            } else {
+                actual_period - beat_error_sec / 2.0
+            };
+
+            let sample_idx = (current_time * sample_rate as f64).round() as usize;
+            if sample_idx < total_samples {
+                let tick_dur = (sample_rate as f64 * 0.004) as usize;
+                for j in 0..tick_dur {
+                    let t = j as f64 / sample_rate as f64;
+                    let envelope = (-t * 1200.0).exp();
+                    let sample = (2.0 * std::f64::consts::PI * 5000.0 * t).sin() * envelope * amplitude as f64;
+                    let idx = sample_idx + j;
+                    if idx < total_samples {
+                        audio[idx] += sample as f32;
+                    }
+                }
+            }
+
+            current_time += interval;
+            beat_count += 1;
+        }
+
+        audio
+    }
+
+    #[test]
+    fn test_synthetic_click_train_21600_bph() {
+        let sr = 44100;
+        let mut p = DspPipeline::new(sr as f64);
+        let samples = synthetic_click_train(21600, 0.0, 0.0, sr, 5.0, 0.5);
+
+        let total_expected = (21600.0_f64 / 3600.0 * 5.0).ceil() as usize;
+        p.process_samples(&samples);
+
+        // Should detect close to the expected number of ticks
+        let detected = p.ticks.len();
+        assert!(
+            (detected as isize - total_expected as isize).abs() <= 2,
+            "expected ~{} ticks from 21600 BPH @ 5s, got {}",
+            total_expected,
+            detected,
+        );
+
+        // Detected BPH should be 21600
+        assert_eq!(p.detected_bph, 21600, "BPH should be detected as 21600");
+
+        // Mean interval should be approximately 1/6 = 0.1667s
+        let mean_interval: f64 = p.ticks.iter().skip(1).map(|t| t.interval).sum::<f64>()
+            / (p.ticks.len().saturating_sub(1)) as f64;
+        let expected_interval = 1.0 / (21600.0 / 3600.0);
+        let tolerance = expected_interval * 0.02; // 2% tolerance
+        assert!(
+            (mean_interval - expected_interval).abs() < tolerance,
+            "mean interval {:.6}s, expected {:.6}s ± {:.6}s",
+            mean_interval,
+            expected_interval,
+            tolerance,
+        );
+    }
+
+    #[test]
+    fn test_synthetic_click_train_drift_detection() {
+        // 21600 BPH with +12 s/day drift should produce a measurably
+        // longer mean interval than the nominal 0.1667s.
+        let sr = 44100;
+        let mut p = DspPipeline::new(sr as f64);
+        let samples = synthetic_click_train(21600, 12.0, 0.0, sr, 10.0, 0.5);
+        p.process_samples(&samples);
+
+        let nominal_interval = 1.0 / (21600.0 / 3600.0); // ≈ 0.1667
+        let detected = p.ticks.len();
+        assert!(detected > 50, "should detect many ticks, got {}", detected);
+
+        let mean_interval: f64 = p.ticks.iter().skip(1).map(|t| t.interval).sum::<f64>()
+            / (p.ticks.len().saturating_sub(1)) as f64;
+
+        // With +12 s/day drift the interval should be slightly above nominal
+        assert!(
+            mean_interval > nominal_interval,
+            "drift of +12 s/day should increase interval (got {:.6}s, nominal {:.6}s)",
+            mean_interval,
+            nominal_interval,
+        );
+    }
 }
