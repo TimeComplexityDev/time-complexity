@@ -33,31 +33,29 @@ pub struct MetricsEngine {
     half_periods: VecDeque<f64>,
     last_sent_tick: u64,
 
-    // Per-tick rate for short window averaging
     short_window_rates: VecDeque<f64>,
     short_window_duration: f64,
 
-    // Long-term EWMA
     long_ewma: Option<f64>,
     long_ewma_tau: f64,
 
-    // Last known values for aggregate
     last_beat_error: f64,
     last_amplitude: f64,
     last_instant_rate: f64,
 
     last_aggregate_time: std::time::Instant,
     aggregate_interval_ms: u64,
+
+    pending_messages: Vec<TickEventMessage>,
 }
 
 impl MetricsEngine {
-    pub fn new(session_id: String, sample_rate: f64, bph: u32) -> Self {
-        let nominal_interval = 3600.0 / bph as f64;
+    pub fn new(session_id: String, sample_rate: f64) -> Self {
         MetricsEngine {
             session_id,
             sample_rate,
-            bph,
-            nominal_interval,
+            bph: 28800,
+            nominal_interval: 3600.0 / 28800.0,
             half_periods: VecDeque::with_capacity(4),
             last_sent_tick: 0,
             short_window_rates: VecDeque::new(),
@@ -69,6 +67,7 @@ impl MetricsEngine {
             last_instant_rate: 0.0,
             last_aggregate_time: std::time::Instant::now(),
             aggregate_interval_ms: 1000,
+            pending_messages: Vec::new(),
         }
     }
 
@@ -77,14 +76,9 @@ impl MetricsEngine {
         self.nominal_interval = 3600.0 / bph as f64;
     }
 
-    /// Process new ticks from the DSP pipeline.
-    /// Returns messages to send over WebSocket.
-    pub fn process_ticks(
-        &mut self,
-        ticks: &[TickEvent],
-    ) -> (Vec<TickEventMessage>, Option<AggregateUpdate>) {
-        let mut messages = Vec::new();
-        let mut aggregate = None;
+    pub fn ingest_ticks(&mut self, ticks: &[TickEvent]) {
+        let ticks_per_sec = self.bph as f64 / 3600.0;
+        let window_samples = (self.short_window_duration * ticks_per_sec).ceil() as usize;
 
         for tick in ticks {
             if tick.tick_index <= self.last_sent_tick {
@@ -96,30 +90,26 @@ impl MetricsEngine {
             self.last_instant_rate = rate;
             self.last_amplitude = tick.amplitude;
 
-            // Accumulate half-periods for beat error
             self.half_periods.push_back(tick.interval);
             if self.half_periods.len() >= 2 {
                 let h1 = self.half_periods[0];
                 let h2 = self.half_periods[1];
                 self.last_beat_error = (h1 - h2).abs();
-                self.half_periods.pop_front(); // slide: keep h2, wait for next
+                self.half_periods.pop_front();
             }
 
-            // Short window: maintain rolling window of rates
             self.short_window_rates.push_back(rate);
-            let window_samples = (self.short_window_duration * 6.0) as usize; // ~6 ticks/sec at 21600 BPH
             while self.short_window_rates.len() > window_samples {
                 self.short_window_rates.pop_front();
             }
 
-            // Long EWMA
             let alpha = 1.0 - (-tick.interval / self.long_ewma_tau).exp();
             self.long_ewma = Some(match self.long_ewma {
                 Some(prev) => prev + alpha * (rate - prev),
                 None => rate,
             });
 
-            messages.push(TickEventMessage {
+            self.pending_messages.push(TickEventMessage {
                 r#type: "tick".to_string(),
                 session_id: self.session_id.clone(),
                 tick_index: tick.tick_index,
@@ -129,8 +119,12 @@ impl MetricsEngine {
                 amplitude: tick.amplitude,
             });
         }
+    }
 
-        // Check if it's time for an aggregate update
+    pub fn drain_messages(&mut self) -> (Vec<TickEventMessage>, Option<AggregateUpdate>) {
+        let messages = self.pending_messages.drain(..).collect();
+        let mut aggregate = None;
+
         let elapsed = self.last_aggregate_time.elapsed();
         if elapsed.as_millis() >= self.aggregate_interval_ms as u128 {
             self.last_aggregate_time = std::time::Instant::now();
@@ -154,6 +148,18 @@ impl MetricsEngine {
         }
 
         (messages, aggregate)
+    }
+
+    pub fn current_rate(&self) -> f64 {
+        self.last_instant_rate
+    }
+
+    pub fn current_beat_error(&self) -> f64 {
+        self.last_beat_error
+    }
+
+    pub fn current_amplitude(&self) -> f64 {
+        self.last_amplitude
     }
 
     fn compute_rate(&self, interval_s: f64) -> f64 {

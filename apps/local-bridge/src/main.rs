@@ -6,7 +6,7 @@ use axum::{
     },
     http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -26,6 +26,35 @@ use uuid::Uuid;
 
 mod dsp;
 mod metrics;
+
+// ---------------------------------------------------------------------------
+// Application error type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum AppError {
+    BadRequest(&'static str),
+    Conflict(&'static str),
+    Unauthorized,
+    Internal(String),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        match self {
+            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
+            AppError::Conflict(m) => (StatusCode::CONFLICT, m).into_response(),
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+        }
+    }
+}
+
+impl From<String> for AppError {
+    fn from(s: String) -> Self {
+        AppError::Internal(s)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Audio stream backend — mic (cpal) or file (symphonia)
@@ -127,7 +156,6 @@ struct StreamQuery {
 struct DeviceConfig {
     device_name: String,
     sample_rate: u32,
-    bph: u32,
     lift_angle: f64,
 }
 
@@ -137,24 +165,33 @@ struct StatusResponse {
     device: DeviceConfig,
     session_id: Option<String>,
     total_samples: u64,
+    bph: u32,
+}
+
+struct SessionState {
+    session_id: Option<String>,
+    audio_stream: SafeStream,
+    sample_count: Arc<AtomicU64>,
+}
+
+impl SessionState {
+    fn running(&self) -> bool {
+        self.audio_stream.is_active()
+    }
+}
+
+struct CaptureConfig {
+    input_file: Option<PathBuf>,
+    loop_playback: bool,
 }
 
 struct AppState {
     pair_token: String,
     device: DeviceConfig,
-    session_id: Option<String>,
-    audio_stream: SafeStream,
-    sample_count: Arc<AtomicU64>,
+    session: SessionState,
     pipeline: Arc<Mutex<dsp::DspPipeline>>,
     bph_override: Option<u32>,
-    input_file: Option<PathBuf>,
-    loop_playback: bool,
-}
-
-impl AppState {
-    fn running(&self) -> bool {
-        self.audio_stream.is_active()
-    }
+    capture_config: CaptureConfig,
 }
 
 type SharedState = Arc<RwLock<AppState>>;
@@ -256,6 +293,7 @@ fn start_mic_capture(
     let config = find_input_config(&device)?;
     let sample_rate = config.sample_rate().0;
     let stream_config = config.config();
+    let channels = stream_config.channels as usize;
 
     println!(
         "Starting mic capture: device='{}', sample_rate={}, channels={}, format={:?}",
@@ -268,7 +306,6 @@ fn start_mic_capture(
     let sample_count = Arc::new(AtomicU64::new(0));
     let count = sample_count.clone();
     let name = actual_name.clone();
-    let channels = stream_config.channels as usize;
 
     let err_fn = move |err: cpal::StreamError| {
         eprintln!("mic error on '{}': {}", name, err);
@@ -420,13 +457,11 @@ fn play_file(
                         let channels = decoded.spec().channels.count() as u64;
                         sample_count.fetch_add(frames * channels, Ordering::Relaxed);
 
-                        // Convert to interleaved f32 samples for the DSP pipeline
                         let spec = *decoded.spec();
                         let mut buf = SampleBuffer::<f32>::new(frames, spec);
                         buf.copy_interleaved_ref(decoded);
                         let samples = buf.samples();
 
-                        // Mono-mix: average channels if needed
                         if channels > 1 {
                             let mono: Vec<f32> = samples
                                 .chunks(channels as usize)
@@ -457,7 +492,6 @@ fn play_file(
             break;
         }
 
-        // Re-open file for next loop
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) => {
@@ -493,16 +527,16 @@ async fn auth(
     headers: HeaderMap,
     request: Request<axum::body::Body>,
     next: Next,
-) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
+) -> Result<impl IntoResponse, AppError> {
     let token = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or((StatusCode::UNAUTHORIZED, "missing Authorization header"))?;
+        .ok_or(AppError::BadRequest("missing Authorization header"))?;
 
     let pair_token = state.read().await.pair_token.clone();
     if token != pair_token {
-        return Err((StatusCode::UNAUTHORIZED, "invalid pairing token"));
+        return Err(AppError::Unauthorized);
     }
 
     Ok(next.run(request).await)
@@ -511,17 +545,12 @@ async fn auth(
 async fn pair_handler(
     State(state): State<SharedState>,
     Json(body): Json<PairRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let token = body.token;
     let config = Config {
         pair_token: token.clone(),
     };
-    save_config(&config).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to save pairing token",
-        )
-    })?;
+    save_config(&config).map_err(|_| AppError::Internal("failed to save pairing token".into()))?;
     state.write().await.pair_token = token.clone();
 
     Ok(Json(serde_json::json!({ "status": "ok", "token": token })))
@@ -531,69 +560,74 @@ async fn devices_handler() -> Json<Vec<String>> {
     Json(list_input_devices())
 }
 
+fn effective_bph(state: &AppState) -> u32 {
+    state
+        .bph_override
+        .or_else(|| state.pipeline.lock().ok().map(|p| p.detected_bph))
+        .unwrap_or(dsp::DEFAULT_BPH)
+}
+
 async fn status_handler(
     State(state): State<SharedState>,
 ) -> Json<StatusResponse> {
     let s = state.read().await;
     Json(StatusResponse {
-        running: s.running(),
+        running: s.session.running(),
         device: s.device.clone(),
-        session_id: s.session_id.clone(),
-        total_samples: s.sample_count.load(Ordering::Relaxed),
+        session_id: s.session.session_id.clone(),
+        total_samples: s.session.sample_count.load(Ordering::Relaxed),
+        bph: effective_bph(&s),
     })
 }
 
 async fn start_handler(
     State(state): State<SharedState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AppError> {
     {
         let s = state.read().await;
-        if s.running() {
-            return Err((StatusCode::CONFLICT, "session already running".to_string()));
+        if s.session.running() {
+            return Err(AppError::Conflict("session already running"));
         }
     }
 
     let capture = {
         let s = state.read().await;
         let pipe = s.pipeline.clone();
-        if let Some(path) = &s.input_file {
-            start_file_capture(path, s.loop_playback, &pipe)
+        if let Some(path) = &s.capture_config.input_file {
+            start_file_capture(path, s.capture_config.loop_playback, &pipe).map_err(AppError::Internal)
         } else {
-            start_mic_capture(&pipe)
+            start_mic_capture(&pipe).map_err(AppError::Internal)
         }
     };
 
-    let mut s = state.write().await;
     match capture {
         Ok(session) => {
+            let mut s = state.write().await;
             s.pipeline.lock().unwrap().set_sample_rate(session.sample_rate as f64);
-            s.session_id = Some(Uuid::new_v4().to_string());
+            s.session.session_id = Some(Uuid::new_v4().to_string());
             s.device.device_name = session.device_name;
             s.device.sample_rate = session.sample_rate;
-            s.audio_stream = session.stream;
-            s.sample_count = session.sample_count;
+            s.session.audio_stream = session.stream;
+            s.session.sample_count = session.sample_count;
             Ok(Json(serde_json::json!({
                 "status": "started",
-                "session_id": s.session_id.clone()
+                "session_id": s.session.session_id.clone()
             })))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to start capture: {}", e),
-        )),
+        Err(e) => Err(e),
     }
 }
 
 async fn stop_handler(
     State(state): State<SharedState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let mut s = state.write().await;
-    if !s.running() {
-        return Err((StatusCode::CONFLICT, "no running session".to_string()));
+    if !s.session.running() {
+        return Err(AppError::Conflict("no running session"));
     }
-    let session_id = s.session_id.take();
-    s.audio_stream = SafeStream(None);
-    let total = s.sample_count.load(Ordering::Relaxed);
+    let session_id = s.session.session_id.take();
+    s.session.audio_stream = SafeStream(None);
+    let total = s.session.sample_count.load(Ordering::Relaxed);
     println!("Session stopped: {} total samples processed", total);
     Ok(Json(serde_json::json!({ "status": "stopped", "session_id": session_id })))
 }
@@ -605,11 +639,10 @@ async fn stop_handler(
 async fn set_params_handler(
     State(state): State<SharedState>,
     Json(body): Json<SetParamsRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let mut s = state.write().await;
     if let Some(bph) = body.bph {
         s.bph_override = Some(bph);
-        s.device.bph = bph;
     }
     if let Some(freq) = body.bandpass_freq {
         let q = body.bandpass_q.unwrap_or(0.4);
@@ -626,11 +659,11 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<SharedState>,
     Query(query): Query<StreamQuery>,
-) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
+) -> Result<impl IntoResponse, AppError> {
     let expected_token = state.read().await.pair_token.clone();
     let provided = query.token.as_deref().unwrap_or("");
     if provided != expected_token {
-        return Err((StatusCode::UNAUTHORIZED, "invalid or missing token"));
+        return Err(AppError::Unauthorized);
     }
     Ok(ws.on_upgrade(move |socket| handle_socket(socket, state)))
 }
@@ -638,10 +671,10 @@ async fn ws_handler(
 async fn handle_socket(mut socket: WebSocket, state: SharedState) {
     let (sample_rate, session_id) = {
         let s = state.read().await;
-        (s.device.sample_rate as f64, s.session_id.clone().unwrap_or_default())
+        (s.device.sample_rate as f64, s.session.session_id.clone().unwrap_or_default())
     };
 
-    let mut metrics = metrics::MetricsEngine::new(session_id, sample_rate, 28800);
+    let mut metrics = metrics::MetricsEngine::new(session_id, sample_rate);
 
     loop {
         tokio::select! {
@@ -652,7 +685,6 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
                             if let Some(bph) = cmd.get("bph").and_then(|v| v.as_u64()) {
                                 let mut s = state.write().await;
                                 s.bph_override = Some(bph as u32);
-                                s.device.bph = bph as u32;
                                 metrics.set_bph(bph as u32);
                             }
                         }
@@ -662,19 +694,14 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                let bph_override = { state.read().await.bph_override };
                 let new_ticks = {
                     let guard = state.read().await;
-                    let mut p = guard.pipeline.lock().unwrap();
-                    if let Some(bph) = bph_override {
-                        if p.detected_bph != bph {
-                            p.detected_bph = bph;
-                        }
-                    }
+                    let p = guard.pipeline.lock().unwrap();
                     p.ticks.clone()
                 };
 
-                let (tick_msgs, aggregate) = metrics.process_ticks(&new_ticks);
+                metrics.ingest_ticks(&new_ticks);
+                let (tick_msgs, aggregate) = metrics.drain_messages();
 
                 for msg in tick_msgs {
                     if let Ok(json) = serde_json::to_string(&msg) {
@@ -724,16 +751,19 @@ async fn main() -> Result<()> {
         device: DeviceConfig {
             device_name: String::new(),
             sample_rate: 96000,
-            bph: 28800,
             lift_angle: 52.0,
         },
-        session_id: None,
-        audio_stream: SafeStream(None),
-        sample_count: Arc::new(AtomicU64::new(0)),
+        session: SessionState {
+            session_id: None,
+            audio_stream: SafeStream(None),
+            sample_count: Arc::new(AtomicU64::new(0)),
+        },
         pipeline: Arc::new(Mutex::new(dsp::DspPipeline::new(44100.0))),
         bph_override: None,
-        input_file: args.input_file.clone(),
-        loop_playback: args.loop_playback,
+        capture_config: CaptureConfig {
+            input_file: args.input_file.clone(),
+            loop_playback: args.loop_playback,
+        },
     }));
 
     if args.input_file.is_some() {
