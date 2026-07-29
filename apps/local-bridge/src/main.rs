@@ -15,7 +15,7 @@ struct Args {
     pair_token: Option<String>,
 
     #[arg(long)]
-    input_file: Option<String>,
+    input_file: Option<PathBuf>,
 
     #[arg(long)]
     reset_pairing: bool,
@@ -55,10 +55,19 @@ fn save_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn persist_token(token: String) -> Result<Config> {
+    let config = Config { pair_token: token };
+    save_config(&config)?;
+    Ok(config)
+}
+
 fn reset_pairing() -> Result<()> {
     let path = config_path()?;
     if path.exists() {
         fs::remove_file(&path).context("failed to remove config file")?;
+    }
+    if let Ok(dir) = config_dir() {
+        let _ = fs::remove_dir(&dir);
     }
     Ok(())
 }
@@ -73,30 +82,15 @@ fn main() -> Result<()> {
     }
 
     let config = if let Some(token) = args.pair_token {
-        let config = Config { pair_token: token };
-        save_config(&config)?;
-        config
+        persist_token(token)?
     } else {
         match load_config()? {
             Some(existing) => existing,
-            None => {
-                let token = Uuid::new_v4().to_string();
-                let config = Config { pair_token: token };
-                save_config(&config)?;
-                config
-            }
+            None => persist_token(Uuid::new_v4().to_string())?,
         }
     };
 
     println!("Pairing token: {}", config.pair_token);
-    if let Ok(path) = config_path() {
-        println!("Config path: {}", path.display());
-    }
-    if let Some(input) = args.input_file {
-        println!("Input file: {}", input);
-    }
-    println!("Listening on 127.0.0.1:{}", args.port);
-    println!("(HTTP server and audio capture not yet implemented)");
 
     Ok(())
 }
