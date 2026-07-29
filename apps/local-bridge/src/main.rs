@@ -14,13 +14,37 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-struct SafeStream(Option<cpal::Stream>);
+// ---------------------------------------------------------------------------
+// Audio stream backend — mic (cpal) or file (symphonia)
+// ---------------------------------------------------------------------------
+
+struct FilePlayback {
+    stop_flag: Arc<AtomicBool>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for FilePlayback {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[allow(dead_code)]
+enum StreamBackend {
+    Mic(cpal::Stream),
+    File(FilePlayback),
+}
+
+struct SafeStream(Option<StreamBackend>);
 unsafe impl Send for SafeStream {}
 unsafe impl Sync for SafeStream {}
 
@@ -37,6 +61,10 @@ struct CaptureSession {
     sample_rate: u32,
 }
 
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -46,12 +74,21 @@ struct Args {
     #[arg(long)]
     pair_token: Option<String>,
 
+    /// Path to an audio file (MP3/WAV) for offline analysis instead of live mic
     #[arg(long)]
     input_file: Option<PathBuf>,
+
+    /// Loop file playback at EOF
+    #[arg(long, default_value_t = false)]
+    loop_playback: bool,
 
     #[arg(long)]
     reset_pairing: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
@@ -85,6 +122,8 @@ struct AppState {
     session_id: Option<String>,
     audio_stream: SafeStream,
     sample_count: Arc<AtomicU64>,
+    input_file: Option<PathBuf>,
+    loop_playback: bool,
 }
 
 impl AppState {
@@ -94,6 +133,10 @@ impl AppState {
 }
 
 type SharedState = Arc<RwLock<AppState>>;
+
+// ---------------------------------------------------------------------------
+// Config helpers
+// ---------------------------------------------------------------------------
 
 fn config_dir() -> Result<PathBuf> {
     dirs::home_dir()
@@ -143,6 +186,10 @@ fn reset_pairing() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Device discovery
+// ---------------------------------------------------------------------------
+
 fn list_input_devices() -> Vec<String> {
     let host = cpal::default_host();
     match host.input_devices() {
@@ -150,6 +197,10 @@ fn list_input_devices() -> Vec<String> {
         Err(_) => vec![],
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mic capture (cpal)
+// ---------------------------------------------------------------------------
 
 fn find_input_config(
     device: &cpal::Device,
@@ -168,9 +219,7 @@ fn find_input_config(
         .map_err(|e| format!("no default audio input config: {}", e))
 }
 
-fn start_audio_capture(
-    device_name: Option<&str>,
-) -> Result<CaptureSession, String> {
+fn start_mic_capture(device_name: Option<&str>) -> Result<CaptureSession, String> {
     let host = cpal::default_host();
     let device = if let Some(name) = device_name {
         host.input_devices()
@@ -188,7 +237,7 @@ fn start_audio_capture(
     let stream_config = config.config();
 
     println!(
-        "Starting audio capture: device='{}', sample_rate={}, channels={}, format={:?}",
+        "Starting mic capture: device='{}', sample_rate={}, channels={}, format={:?}",
         actual_name,
         sample_rate,
         stream_config.channels,
@@ -200,7 +249,7 @@ fn start_audio_capture(
     let name = actual_name.clone();
 
     let err_fn = move |err: cpal::StreamError| {
-        eprintln!("audio error on '{}': {}", name, err);
+        eprintln!("mic error on '{}': {}", name, err);
     };
 
     let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -209,24 +258,176 @@ fn start_audio_capture(
 
     let stream = device
         .build_input_stream(&stream_config, data_fn, err_fn, None)
-        .map_err(|e| format!("failed to build audio stream: {}", e))?;
+        .map_err(|e| format!("failed to build mic stream: {}", e))?;
 
     stream
         .play()
-        .map_err(|e| format!("failed to start audio stream: {}", e))?;
+        .map_err(|e| format!("failed to start mic stream: {}", e))?;
 
-    println!(
-        "Audio capture running: {} @ {} Hz",
-        actual_name, sample_rate
-    );
+    println!("Mic capture running: {} @ {} Hz", actual_name, sample_rate);
 
     Ok(CaptureSession {
-        stream: SafeStream(Some(stream)),
+        stream: SafeStream(Some(StreamBackend::Mic(stream))),
         device_name: actual_name,
         sample_count,
         sample_rate,
     })
 }
+
+// ---------------------------------------------------------------------------
+// File capture (symphonia)
+// ---------------------------------------------------------------------------
+
+fn start_file_capture(
+    path: &std::path::Path,
+    loop_playback: bool,
+) -> Result<CaptureSession, String> {
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let probed = symphonia::default::get_probe()
+        .format(&Hint::new(), mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| format!("failed to probe audio file: {}", e))?;
+
+    let mut format = probed.format;
+
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or_else(|| "no audio track found".to_string())?;
+
+    let codec_params = track.codec_params.clone();
+    let track_id = track.id;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("failed to create decoder: {}", e))?;
+
+    let sample_rate = codec_params.sample_rate.unwrap_or(48_000);
+    let device_name = format!(
+        "file: {} ({} Hz, {} ch)",
+        path.file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or(std::borrow::Cow::Borrowed("unknown")),
+        sample_rate,
+        codec_params.channels.map(|c| c.count()).unwrap_or(0),
+    );
+
+    println!("Starting file capture: {} (loop={})", device_name, loop_playback);
+
+    let sample_count = Arc::new(AtomicU64::new(0));
+    let count = sample_count.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let flag = stop_flag.clone();
+    let path = path.to_path_buf();
+
+    let join_handle = std::thread::spawn(move || {
+        let _ = play_file(
+            &path,
+            loop_playback,
+            &mut format,
+            &mut decoder,
+            track_id,
+            &count,
+            &flag,
+        );
+    });
+
+    let handle = FilePlayback {
+        stop_flag,
+        join_handle: Some(join_handle),
+    };
+
+    Ok(CaptureSession {
+        stream: SafeStream(Some(StreamBackend::File(handle))),
+        device_name,
+        sample_count,
+        sample_rate,
+    })
+}
+
+fn play_file(
+    path: &std::path::Path,
+    loop_playback: bool,
+    format: &mut Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: &mut Box<dyn symphonia::core::codecs::Decoder>,
+    track_id: u32,
+    sample_count: &AtomicU64,
+    stop_flag: &AtomicBool,
+) -> Result<(), String> {
+
+    loop {
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            match format.next_packet() {
+                Ok(packet) => {
+                    if packet.track_id() != track_id {
+                        continue;
+                    }
+
+                    if let Ok(decoded) = decoder.decode(&packet) {
+                        let frames = decoded.frames() as u64;
+                        let channels = decoded.spec().channels.count() as u64;
+                        sample_count.fetch_add(frames * channels, Ordering::Relaxed);
+                    }
+                }
+                Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+                Err(symphonia::core::errors::Error::IoError(ref e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("file decode error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        if !loop_playback {
+            break;
+        }
+
+        // Re-open file for next loop
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("file error on re-open: {}", e);
+                break;
+            }
+        };
+        let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
+        let probed = match symphonia::default::get_probe().format(
+            &symphonia::core::probe::Hint::new(),
+            mss,
+            &symphonia::core::formats::FormatOptions::default(),
+            &symphonia::core::meta::MetadataOptions::default(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("file re-probe error: {}", e);
+                break;
+            }
+        };
+        *format = probed.format;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// HTTP handlers
+// ---------------------------------------------------------------------------
 
 async fn auth(
     State(state): State<SharedState>,
@@ -293,7 +494,14 @@ async fn start_handler(
         }
     }
 
-    let capture = start_audio_capture(None);
+    let capture = {
+        let s = state.read().await;
+        if let Some(path) = &s.input_file {
+            start_file_capture(path, s.loop_playback)
+        } else {
+            start_mic_capture(None)
+        }
+    };
 
     let mut s = state.write().await;
     match capture {
@@ -308,7 +516,10 @@ async fn start_handler(
                 "session_id": s.session_id.clone()
             })))
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("failed to start capture: {}", e))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to start capture: {}", e),
+        )),
     }
 }
 
@@ -319,10 +530,16 @@ async fn stop_handler(
     if !s.running() {
         return Err((StatusCode::CONFLICT, "no running session".to_string()));
     }
-    s.audio_stream = SafeStream(None);
     let session_id = s.session_id.take();
+    s.audio_stream = SafeStream(None);
+    let total = s.sample_count.load(Ordering::Relaxed);
+    println!("Session stopped: {} total samples processed", total);
     Ok(Json(serde_json::json!({ "status": "stopped", "session_id": session_id })))
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -354,7 +571,29 @@ async fn main() -> Result<()> {
         session_id: None,
         audio_stream: SafeStream(None),
         sample_count: Arc::new(AtomicU64::new(0)),
+        input_file: args.input_file.clone(),
+        loop_playback: args.loop_playback,
     }));
+
+    // Auto-start file playback if --input-file was provided
+    if let Some(path) = &args.input_file {
+        println!("File mode active: {}", path.display());
+        let capture = start_file_capture(path, args.loop_playback);
+        match capture {
+            Ok(session) => {
+                let mut s = state.write().await;
+                s.session_id = Some(Uuid::new_v4().to_string());
+                s.device.device_name = session.device_name;
+                s.device.sample_rate = session.sample_rate;
+                s.audio_stream = session.stream;
+                s.sample_count = session.sample_count;
+                println!("File playback started automatically (--input-file mode)");
+            }
+            Err(e) => {
+                eprintln!("Failed to start file capture: {}", e);
+            }
+        }
+    }
 
     let public_routes = Router::new().route("/pair", post(pair_handler));
 
