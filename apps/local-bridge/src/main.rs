@@ -43,23 +43,25 @@ struct PairRequest {
     token: String,
 }
 
-#[derive(Serialize)]
-struct StatusResponse {
-    running: bool,
+#[derive(Serialize, Clone)]
+struct DeviceConfig {
     device_name: String,
     sample_rate: u32,
     bph: u32,
     lift_angle: f64,
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    running: bool,
+    device: DeviceConfig,
     session_id: Option<String>,
 }
 
 struct AppState {
     pair_token: String,
     running: bool,
-    device_name: String,
-    sample_rate: u32,
-    bph: u32,
-    lift_angle: f64,
+    device: DeviceConfig,
     session_id: Option<String>,
 }
 
@@ -170,10 +172,7 @@ async fn status_handler(
     let s = state.read().await;
     Json(StatusResponse {
         running: s.running,
-        device_name: s.device_name.clone(),
-        sample_rate: s.sample_rate,
-        bph: s.bph,
-        lift_angle: s.lift_angle,
+        device: s.device.clone(),
         session_id: s.session_id.clone(),
     })
 }
@@ -224,10 +223,12 @@ async fn main() -> Result<()> {
     let state: SharedState = Arc::new(RwLock::new(AppState {
         pair_token: config.pair_token.clone(),
         running: false,
-        device_name: String::new(),
-        sample_rate: 96000,
-        bph: 28800,
-        lift_angle: 52.0,
+        device: DeviceConfig {
+            device_name: String::new(),
+            sample_rate: 96000,
+            bph: 28800,
+            lift_angle: 52.0,
+        },
         session_id: None,
     }));
 
