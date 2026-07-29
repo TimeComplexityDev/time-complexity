@@ -12,6 +12,6 @@
 - [x] Every request requires `Authorization: Bearer <pair-token>` header; missing/invalid returns 401
 - [x] `POST /pair` accepts a token and stores it as the active pairing token
 - [x] `GET /devices` returns the list of available audio input device names
-- [x] `GET /status` returns `{ running, device_name, sample_rate, bph, lift_angle, session_id }`
+- [x] `GET /status` returns `{ running, device: { device_name, sample_rate, bph, lift_angle }, session_id, total_samples }`
 - [x] `POST /start` begins a session (no audio yet, just transitions state)
 - [x] `POST /stop` ends the session and returns a confirmation

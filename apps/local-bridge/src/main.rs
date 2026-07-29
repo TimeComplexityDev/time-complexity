@@ -51,6 +51,10 @@ enum StreamBackend {
     File(FilePlayback),
 }
 
+// cpal 0.15 marks Stream as !Send and !Sync via NotSendSyncAcrossAllPlatforms
+// for portability safety. On macOS/CoreAudio the stream handle is backed by
+// an AudioUnit which is fully thread-safe (Send + Sync). This wrapper is the
+// standard workaround for single-platform macOS Rust audio apps.
 struct SafeStream(Option<StreamBackend>);
 unsafe impl Send for SafeStream {}
 unsafe impl Sync for SafeStream {}
@@ -264,6 +268,7 @@ fn start_mic_capture(
     let sample_count = Arc::new(AtomicU64::new(0));
     let count = sample_count.clone();
     let name = actual_name.clone();
+    let channels = stream_config.channels as usize;
 
     let err_fn = move |err: cpal::StreamError| {
         eprintln!("mic error on '{}': {}", name, err);
@@ -272,8 +277,17 @@ fn start_mic_capture(
     let pipe = pipeline.clone();
     let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         count.fetch_add(data.len() as u64, Ordering::Relaxed);
+        let samples = if channels > 1 {
+            let mono: Vec<f32> = data
+                .chunks(channels)
+                .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
+                .collect();
+            mono
+        } else {
+            data.to_vec()
+        };
         if let Ok(mut p) = pipe.lock() {
-            p.process_samples(data);
+            p.process_samples(&samples);
         }
     };
 
@@ -611,14 +625,17 @@ async fn set_params_handler(
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<SharedState>,
-    Query(_query): Query<StreamQuery>,
-) -> impl IntoResponse {
-    let token = state.read().await.pair_token.clone();
-    // Allow auth via query param or Authorization header (checked by middleware)
-    ws.on_upgrade(move |socket| handle_socket(socket, state, token))
+    Query(query): Query<StreamQuery>,
+) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
+    let expected_token = state.read().await.pair_token.clone();
+    let provided = query.token.as_deref().unwrap_or("");
+    if provided != expected_token {
+        return Err((StatusCode::UNAUTHORIZED, "invalid or missing token"));
+    }
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state)))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: SharedState, _expected_token: String) {
+async fn handle_socket(mut socket: WebSocket, state: SharedState) {
     let (sample_rate, session_id) = {
         let s = state.read().await;
         (s.device.sample_rate as f64, s.session_id.clone().unwrap_or_default())

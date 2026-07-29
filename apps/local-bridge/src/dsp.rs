@@ -5,17 +5,19 @@ use std::collections::VecDeque;
 // ---------------------------------------------------------------------------
 
 pub const COMMON_BPH: &[u32] = &[18000, 19800, 21600, 25200, 28800, 36000];
+pub const DEFAULT_BPH: u32 = 28800;
+pub const REFRACTORY_FRACTION: f64 = 0.25;
 
 pub fn nearest_bph(interval_samples: f64, sample_rate: f64) -> u32 {
     if interval_samples <= 0.0 {
-        return 28800;
+        return DEFAULT_BPH;
     }
     let interval_sec = interval_samples / sample_rate;
     let measured_bph = (3600.0 / interval_sec).round() as u32;
     *COMMON_BPH
         .iter()
         .min_by_key(|&&bph| (bph as i64 - measured_bph as i64).abs())
-        .unwrap_or(&28800)
+        .unwrap_or(&DEFAULT_BPH)
 }
 
 // ---------------------------------------------------------------------------
@@ -215,8 +217,8 @@ pub struct DspPipeline {
     peak_count: u64,
     last_peak_sample: u64,
 
-    /// Observed intervals for BPH auto-detect
-    interval_history: Vec<f64>,
+    /// Observed intervals for BPH auto-detect (capped at 10)
+    interval_history: VecDeque<f64>,
     pub detected_bph: u32,
 
     pub ticks: Vec<TickEvent>,
@@ -242,16 +244,16 @@ impl DspPipeline {
             samples_since_peak: usize::MAX,
             peak_count: 0,
             last_peak_sample: 0,
-            interval_history: Vec::new(),
-            detected_bph: 28800,
+            interval_history: VecDeque::with_capacity(10),
+            detected_bph: DEFAULT_BPH,
             ticks: Vec::new(),
         }
     }
 
     fn compute_refractory(sample_rate: f64) -> usize {
-        let nominal_bph = 28800.0;
+        let nominal_bph = DEFAULT_BPH as f64;
         let nominal_half_period = 3600.0 / nominal_bph;
-        (0.25 * nominal_half_period * sample_rate) as usize
+        (REFRACTORY_FRACTION * nominal_half_period * sample_rate) as usize
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: f64) {
@@ -293,7 +295,7 @@ impl DspPipeline {
         if is_peak {
             self.samples_since_peak = 0;
             let amplitude = self.prev_envelope;
-            let _threshold = self.adaptive.record_peak(amplitude);
+            self.adaptive.record_peak(amplitude);
 
             let idx = self.sample_index - 1;
             let frac = parabolic_peak(
@@ -312,7 +314,10 @@ impl DspPipeline {
             self.last_peak_sample = idx;
 
             if interval > 0.0 {
-                self.interval_history.push(interval);
+                self.interval_history.push_back(interval);
+                if self.interval_history.len() > 10 {
+                    self.interval_history.pop_front();
+                }
             }
 
             // Auto-detect BPH from first 10 intervals
@@ -325,7 +330,7 @@ impl DspPipeline {
                 );
                 // Update refractory period to match detected BPH
                 let half_period = 3600.0 / self.detected_bph as f64;
-                self.refractory_samples = (0.25 * half_period * self.sample_rate).max(1.0) as usize;
+                self.refractory_samples = (REFRACTORY_FRACTION * half_period * self.sample_rate).max(1.0) as usize;
             }
 
             let timestamp = (idx as f64 + frac) / self.sample_rate;
@@ -404,8 +409,8 @@ mod tests {
             .map(|i| (2.0 * std::f64::consts::PI * 2000.0 * i as f64 / 44100.0).sin() as f32)
             .collect();
         p.process_samples(&samples);
-        // Should have produced some tick detections
-        assert!(p.ticks.is_empty() || p.ticks.len() > 0);
+        // 1 second of 2 kHz sine at 44100 Hz should produce detectable envelope peaks
+        assert!(p.ticks.len() > 0, "expected at least 1 tick from 1s of audio, got 0");
     }
 
     /// Generate a synthetic mechanical watch tick track.
