@@ -20,13 +20,22 @@ use std::sync::{
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-// cpal 0.15 marks Stream as !Send and !Sync via
-// NotSendSyncAcrossAllPlatforms for portability safety.
-// On macOS/CoreAudio the stream handle is actually safe to transfer.
-// This is the standard workaround for single-platform apps.
 struct SafeStream(Option<cpal::Stream>);
 unsafe impl Send for SafeStream {}
 unsafe impl Sync for SafeStream {}
+
+impl SafeStream {
+    fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+struct CaptureSession {
+    stream: SafeStream,
+    device_name: String,
+    sample_count: Arc<AtomicU64>,
+    sample_rate: u32,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -72,11 +81,16 @@ struct StatusResponse {
 
 struct AppState {
     pair_token: String,
-    running: bool,
     device: DeviceConfig,
     session_id: Option<String>,
     audio_stream: SafeStream,
     sample_count: Arc<AtomicU64>,
+}
+
+impl AppState {
+    fn running(&self) -> bool {
+        self.audio_stream.is_active()
+    }
 }
 
 type SharedState = Arc<RwLock<AppState>>;
@@ -156,7 +170,7 @@ fn find_input_config(
 
 fn start_audio_capture(
     device_name: Option<&str>,
-) -> Result<(cpal::Stream, String, Arc<AtomicU64>, u32), String> {
+) -> Result<CaptureSession, String> {
     let host = cpal::default_host();
     let device = if let Some(name) = device_name {
         host.input_devices()
@@ -190,17 +204,7 @@ fn start_audio_capture(
     };
 
     let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let prev = count.fetch_add(data.len() as u64, Ordering::Relaxed);
-        let total = prev + data.len() as u64;
-        if total % (sample_rate as u64 * 10) < data.len() as u64 {
-            let secs = total as f64 / sample_rate as f64;
-            println!(
-                "[capture] {} samples received ({:.1}s total, {} per cb)",
-                data.len(),
-                secs,
-                data.len()
-            );
-        }
+        count.fetch_add(data.len() as u64, Ordering::Relaxed);
     };
 
     let stream = device
@@ -216,7 +220,12 @@ fn start_audio_capture(
         actual_name, sample_rate
     );
 
-    Ok((stream, actual_name, sample_count, sample_rate))
+    Ok(CaptureSession {
+        stream: SafeStream(Some(stream)),
+        device_name: actual_name,
+        sample_count,
+        sample_rate,
+    })
 }
 
 async fn auth(
@@ -267,15 +276,11 @@ async fn status_handler(
 ) -> Json<StatusResponse> {
     let s = state.read().await;
     Json(StatusResponse {
-        running: s.running,
+        running: s.running(),
         device: s.device.clone(),
         session_id: s.session_id.clone(),
         total_samples: s.sample_count.load(Ordering::Relaxed),
     })
-}
-
-fn error_response(msg: String) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, msg)
 }
 
 async fn start_handler(
@@ -283,30 +288,27 @@ async fn start_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     {
         let s = state.read().await;
-        if s.audio_stream.0.is_some() {
+        if s.running() {
             return Err((StatusCode::CONFLICT, "session already running".to_string()));
         }
     }
 
     let capture = start_audio_capture(None);
-    let safe_capture: Result<(SafeStream, String, Arc<AtomicU64>, u32), String> = capture
-        .map(|(stream, name, count, rate)| (SafeStream(Some(stream)), name, count, rate));
 
     let mut s = state.write().await;
-    match safe_capture {
-        Ok((safe_stream, device_name, sample_count, sample_rate)) => {
-            s.running = true;
+    match capture {
+        Ok(session) => {
             s.session_id = Some(Uuid::new_v4().to_string());
-            s.device.device_name = device_name;
-            s.device.sample_rate = sample_rate;
-            s.audio_stream = safe_stream;
-            s.sample_count = sample_count;
+            s.device.device_name = session.device_name;
+            s.device.sample_rate = session.sample_rate;
+            s.audio_stream = session.stream;
+            s.sample_count = session.sample_count;
             Ok(Json(serde_json::json!({
                 "status": "started",
                 "session_id": s.session_id.clone()
             })))
         }
-        Err(e) => Err(error_response(format!("failed to start capture: {}", e))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("failed to start capture: {}", e))),
     }
 }
 
@@ -314,10 +316,9 @@ async fn stop_handler(
     State(state): State<SharedState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut s = state.write().await;
-    if !s.running {
+    if !s.running() {
         return Err((StatusCode::CONFLICT, "no running session".to_string()));
     }
-    s.running = false;
     s.audio_stream = SafeStream(None);
     let session_id = s.session_id.take();
     Ok(Json(serde_json::json!({ "status": "stopped", "session_id": session_id })))
@@ -344,7 +345,6 @@ async fn main() -> Result<()> {
 
     let state: SharedState = Arc::new(RwLock::new(AppState {
         pair_token: config.pair_token.clone(),
-        running: false,
         device: DeviceConfig {
             device_name: String::new(),
             sample_rate: 96000,
