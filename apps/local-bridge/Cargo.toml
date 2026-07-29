@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.7", features = ["ws"] }
+chrono = { version = "0.4", features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
 dirs = "5"

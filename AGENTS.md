@@ -18,3 +18,7 @@ Default label vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `read
 ### Domain docs
 
 Multi-context layout: root `CONTEXT-MAP.md` pointing to per-component `CONTEXT.md` files. See `docs/agents/domain.md`.
+
+## Dependency policy
+
+Prefer well-established, actively maintained libraries over hand-rolled implementations for standard tasks (date/time, serialization, audio decoding, HTTP, CLI parsing). Only hand-roll when the library adds unacceptable weight for the use case, and document the rationale inline.
