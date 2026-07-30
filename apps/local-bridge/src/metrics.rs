@@ -27,6 +27,7 @@ pub struct TickEventMessage {
 
 pub struct MetricsEngine {
     session_id: String,
+    #[allow(dead_code)]
     sample_rate: f64,
     bph: u32,
     nominal_interval: f64,
@@ -150,14 +151,17 @@ impl MetricsEngine {
         (messages, aggregate)
     }
 
+    #[allow(dead_code)]
     pub fn current_rate(&self) -> f64 {
         self.last_instant_rate
     }
 
+    #[allow(dead_code)]
     pub fn current_beat_error(&self) -> f64 {
         self.last_beat_error
     }
 
+    #[allow(dead_code)]
     pub fn current_amplitude(&self) -> f64 {
         self.last_amplitude
     }

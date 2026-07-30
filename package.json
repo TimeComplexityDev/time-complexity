@@ -1,0 +1,12 @@
+{
+  "name": "time-complexity",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n bridge,web -c cyan,green \"npm run dev:bridge\" \"npm run dev:web\"",
+    "dev:bridge": "cargo run --manifest-path apps/local-bridge/Cargo.toml -- --pair-token devtoken",
+    "dev:web": "npm --prefix apps/web run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}

@@ -463,6 +463,89 @@ select {
   margin-top: 16px;
 }
 
+/* Source selector */
+.source-selector {
+  width: 100%;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.source-selector h4 {
+  margin-bottom: 0;
+}
+
+.source-tabs {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.source-tab {
+  flex: 1;
+  padding: 8px 16px;
+  background: var(--bg);
+  color: var(--text);
+  border: none;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.source-tab.active {
+  background: var(--primary);
+  color: #000;
+}
+
+.source-tab:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.source-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.source-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.source-field label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.source-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.source-message {
+  font-size: 0.8rem;
+}
+
+.source-message.success {
+  color: var(--success);
+}
+
+.source-message.error {
+  color: var(--danger);
+}
+
 /* Muted text */
 .muted {
   color: var(--muted);

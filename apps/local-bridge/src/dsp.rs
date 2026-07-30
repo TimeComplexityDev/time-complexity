@@ -70,6 +70,7 @@ impl BiquadFilter {
         ))
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.x1 = 0.0; self.x2 = 0.0;
         self.y1 = 0.0; self.y2 = 0.0;
@@ -107,7 +108,9 @@ pub fn parabolic_peak(y_prev: f64, y_curr: f64, y_next: f64) -> f64 {
 #[derive(Debug, Clone)]
 pub struct TickEvent {
     pub tick_index: u64,
+    #[allow(dead_code)]
     pub sample_index: u64,
+    #[allow(dead_code)]
     pub fractional_offset: f64,
     pub amplitude: f64,
     pub interval: f64,

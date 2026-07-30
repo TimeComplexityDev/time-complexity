@@ -115,14 +115,6 @@ struct Args {
     #[arg(long)]
     pair_token: Option<String>,
 
-    /// Path to an audio file (MP3/WAV) for offline analysis instead of live mic
-    #[arg(long)]
-    input_file: Option<PathBuf>,
-
-    /// Loop file playback at EOF
-    #[arg(long, default_value_t = false)]
-    loop_playback: bool,
-
     #[arg(long)]
     reset_pairing: bool,
 }
@@ -151,6 +143,23 @@ struct SetParamsRequest {
 #[derive(Deserialize)]
 struct StreamQuery {
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SetSourceRequest {
+    #[serde(rename = "type")]
+    source_type: String,
+    device_name: Option<String>,
+    path: Option<String>,
+    #[serde(default)]
+    loop_playback: bool,
+}
+
+#[derive(Clone)]
+enum SourceType {
+    None,
+    Mic(String),
+    File(String, bool),
 }
 
 #[derive(Serialize, Clone)]
@@ -182,8 +191,7 @@ impl SessionState {
 }
 
 struct CaptureConfig {
-    input_file: Option<PathBuf>,
-    loop_playback: bool,
+    source: SourceType,
 }
 
 struct AppState {
@@ -283,12 +291,25 @@ fn find_input_config(
 }
 
 fn start_mic_capture(
+    device_name: Option<&String>,
     pipeline: &Arc<Mutex<dsp::DspPipeline>>,
 ) -> Result<CaptureSession, String> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "no default input device found".to_string())?;
+
+    let device = if let Some(name) = device_name {
+        if name.is_empty() {
+            host.default_input_device()
+                .ok_or_else(|| "no default input device found".to_string())?
+        } else {
+            host.input_devices()
+                .map_err(|e| format!("failed to enumerate devices: {}", e))?
+                .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
+                .ok_or_else(|| format!("device '{}' not found", name))?
+        }
+    } else {
+        host.default_input_device()
+            .ok_or_else(|| "no default input device found".to_string())?
+    };
     let actual_name = device.name().unwrap_or_else(|_| "unknown".to_string());
 
     let config = find_input_config(&device)?;
@@ -594,10 +615,17 @@ async fn start_handler(
     let capture = {
         let s = state.read().await;
         let pipe = s.pipeline.clone();
-        if let Some(path) = &s.capture_config.input_file {
-            start_file_capture(path, s.capture_config.loop_playback, &pipe).map_err(AppError::Internal)
-        } else {
-            start_mic_capture(&pipe).map_err(AppError::Internal)
+        match &s.capture_config.source {
+            SourceType::File(path, loop_playback) => {
+                start_file_capture(std::path::Path::new(path), *loop_playback, &pipe)
+                    .map_err(AppError::Internal)
+            }
+            SourceType::Mic(device_name) => {
+                start_mic_capture(Some(device_name), &pipe).map_err(AppError::Internal)
+            }
+            SourceType::None => {
+                start_mic_capture(None, &pipe).map_err(AppError::Internal)
+            }
         }
     };
 
@@ -631,6 +659,60 @@ async fn stop_handler(
     let total = s.session.sample_count.load(Ordering::Relaxed);
     println!("Session stopped: {} total samples processed", total);
     Ok(Json(serde_json::json!({ "status": "stopped", "session_id": session_id })))
+}
+
+// ---------------------------------------------------------------------------
+// source handler
+// ---------------------------------------------------------------------------
+
+async fn source_handler(
+    State(state): State<SharedState>,
+    body: Option<Json<SetSourceRequest>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match body {
+        Some(Json(body)) => {
+            let source = match body.source_type.as_str() {
+                "mic" => SourceType::Mic(body.device_name.unwrap_or_default()),
+                "file" => SourceType::File(
+                    body.path.ok_or_else(|| AppError::BadRequest("path required for file source"))?,
+                    body.loop_playback,
+                ),
+                _ => return Err(AppError::BadRequest("source type must be 'mic' or 'file'")),
+            };
+            let mut s = state.write().await;
+            s.capture_config.source = source.clone();
+            let resp = match &source {
+                SourceType::Mic(name) => serde_json::json!({
+                    "status": "ok",
+                    "source": { "type": "mic", "device_name": name }
+                }),
+                SourceType::File(path, loop_playback) => serde_json::json!({
+                    "status": "ok",
+                    "source": { "type": "file", "path": path, "loop": loop_playback }
+                }),
+                SourceType::None => serde_json::json!({
+                    "status": "ok",
+                    "source": { "type": "mic", "device_name": "" }
+                }),
+            };
+            Ok(Json(resp))
+        }
+        None => {
+            let s = state.read().await;
+            let resp = match &s.capture_config.source {
+                SourceType::Mic(name) => serde_json::json!({
+                    "source": { "type": "mic", "device_name": name }
+                }),
+                SourceType::File(path, loop_playback) => serde_json::json!({
+                    "source": { "type": "file", "path": path, "loop": loop_playback }
+                }),
+                SourceType::None => serde_json::json!({
+                    "source": { "type": "mic", "device_name": "" }
+                }),
+            };
+            Ok(Json(resp))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -762,14 +844,9 @@ async fn main() -> Result<()> {
         pipeline: Arc::new(Mutex::new(dsp::DspPipeline::new(44100.0))),
         bph_override: None,
         capture_config: CaptureConfig {
-            input_file: args.input_file.clone(),
-            loop_playback: args.loop_playback,
+            source: SourceType::None,
         },
     }));
-
-    if args.input_file.is_some() {
-        println!("File mode configured. Send POST /start to begin playback.");
-    }
 
     let public_routes = Router::new()
         .route("/pair", post(pair_handler))
@@ -777,6 +854,16 @@ async fn main() -> Result<()> {
 
     let protected_routes = Router::new()
         .route("/devices", get(devices_handler))
+        .route(
+            "/source",
+            get(|s: State<SharedState>| async { source_handler(s, None).await }),
+        )
+        .route(
+            "/source",
+            post(|s: State<SharedState>, body: Json<SetSourceRequest>| async {
+                source_handler(s, Some(body)).await
+            }),
+        )
         .route("/status", get(status_handler))
         .route("/start", post(start_handler))
         .route("/stop", post(stop_handler))

@@ -4,6 +4,7 @@ import { usePairing } from '../context/PairingContext';
 import { startCapture, stopCapture, setParams, getStatus, connectStream } from '../api/bridge';
 import TickStream from '../components/TickStream';
 import AggregateGauges from '../components/AggregateGauges';
+import SourceSelector from '../components/SourceSelector';
 import type { TickEvent, AggregateUpdate, StreamMessage } from '../types';
 
 interface Props {
@@ -150,6 +151,8 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
       )}
 
       <div className="capture-view">
+        {!isRecording && <SourceSelector disabled={isRecording} />}
+
         <AggregateGauges aggregate={aggregate} />
         <TickStream ticks={ticks} />
 

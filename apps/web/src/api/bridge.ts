@@ -61,6 +61,31 @@ export async function setParams(params: {
   if (!res.ok) throw new Error(`Set params failed: ${res.statusText}`);
 }
 
+export async function setSource(
+  source: { type: 'mic'; device_name?: string } | { type: 'file'; path: string; loop?: boolean }
+): Promise<void> {
+  const res = await fetch(`${baseUrl()}/source`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(source),
+  });
+  if (!res.ok) throw new Error(`Set source failed: ${res.statusText}`);
+}
+
+export async function getSource(): Promise<{
+  source: { type: 'mic'; device_name: string } | { type: 'file'; path: string; loop: boolean };
+}> {
+  const res = await fetch(`${baseUrl()}/source`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Get source failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function listDevices(): Promise<string[]> {
+  const res = await fetch(`${baseUrl()}/devices`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`List devices failed: ${res.statusText}`);
+  return res.json();
+}
+
 export function connectStream(
   onMessage: (msg: StreamMessage) => void,
   onError?: (err: Event) => void,
