@@ -22,6 +22,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 mod dsp;
@@ -785,7 +786,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
-        .with_state(state);
+        .with_state(state)
+        .layer(CorsLayer::permissive());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     println!("Pairing token: {}", config.pair_token);

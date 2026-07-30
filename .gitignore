@@ -1,5 +1,9 @@
 .DS_Store
 
+# Node.js / npm / Vite
+node_modules/
+*.tsbuildinfo
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
