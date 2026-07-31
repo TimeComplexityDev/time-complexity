@@ -22,3 +22,7 @@ Multi-context layout: root `CONTEXT-MAP.md` pointing to per-component `CONTEXT.m
 ## Dependency policy
 
 Prefer well-established, actively maintained libraries over hand-rolled implementations for standard tasks (date/time, serialization, audio decoding, HTTP, CLI parsing). Only hand-roll when the library adds unacceptable weight for the use case, and document the rationale inline.
+
+## Coding standards
+
+Review `CODING_STANDARDS.md` before writing new components or refactoring existing ones. The code-review skill checks against these rules plus the Fowler smell baseline documented there.
