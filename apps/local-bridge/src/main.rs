@@ -568,14 +568,17 @@ async fn pair_handler(
     State(state): State<SharedState>,
     Json(body): Json<PairRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let token = body.token;
+    let current = state.read().await.pair_token.clone();
+    if body.token != current {
+        return Err(AppError::Unauthorized);
+    }
+    // Token matches — confirm pairing
     let config = Config {
-        pair_token: token.clone(),
+        pair_token: current.clone(),
     };
-    save_config(&config).map_err(|_| AppError::Internal("failed to save pairing token".into()))?;
-    state.write().await.pair_token = token.clone();
+    save_config(&config).map_err(|_| AppError::Internal("failed to save pairing config".into()))?;
 
-    Ok(Json(serde_json::json!({ "status": "ok", "token": token })))
+    Ok(Json(serde_json::json!({ "status": "ok", "token": current })))
 }
 
 async fn devices_handler() -> Json<Vec<String>> {
