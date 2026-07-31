@@ -220,5 +220,5 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Streamlit
-.streamlit/secrets.toml
+# Test assets (large binary fixtures)
+/test-assets/
