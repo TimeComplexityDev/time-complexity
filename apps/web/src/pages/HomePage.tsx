@@ -2,10 +2,10 @@ import { useState } from 'react';
 import { useData } from '../context/DataContext';
 import { usePairing } from '../context/PairingContext';
 import WatchCard from '../components/WatchCard';
-import type { Watch } from '../types';
+import type { Watch, Navigate } from '../types';
 
 interface Props {
-  onNavigate: (page: string, params?: Record<string, string>) => void;
+  onNavigate: Navigate;
 }
 
 export default function HomePage({ onNavigate }: Props) {
@@ -103,7 +103,7 @@ export default function HomePage({ onNavigate }: Props) {
             <WatchCard
               key={w.id}
               watch={w}
-              onClick={() => onNavigate('watch', { watchId: w.id })}
+              onClick={() => onNavigate({ name: 'watch', watchId: w.id })}
               onDelete={removeWatch}
             />
           ))

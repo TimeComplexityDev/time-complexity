@@ -1,15 +1,8 @@
 import type { AggregateUpdate } from '../types';
+import { formatRate, formatBeatError } from '../types';
 
 interface Props {
   aggregate: AggregateUpdate | null;
-}
-
-function formatRate(v: number): string {
-  return `${v >= 0 ? '+' : ''}${v.toFixed(1)}`;
-}
-
-function formatBeatError(v: number): string {
-  return `${(v * 1000).toFixed(2)} ms`;
 }
 
 export default function AggregateGauges({ aggregate }: Props) {
@@ -29,17 +22,14 @@ export default function AggregateGauges({ aggregate }: Props) {
         <div className="gauge">
           <span className="gauge-label">Instant Rate</span>
           <span className="gauge-value">{formatRate(aggregate.instant_rate_spd)}</span>
-          <span className="gauge-unit">s/d</span>
         </div>
         <div className="gauge">
           <span className="gauge-label">Short Avg</span>
           <span className="gauge-value">{formatRate(aggregate.short_avg_spd)}</span>
-          <span className="gauge-unit">s/d</span>
         </div>
         <div className="gauge">
           <span className="gauge-label">Long EWMA</span>
           <span className="gauge-value">{formatRate(aggregate.long_ewma_spd)}</span>
-          <span className="gauge-unit">s/d</span>
         </div>
         <div className="gauge">
           <span className="gauge-label">Beat Error</span>

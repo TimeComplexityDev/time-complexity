@@ -1,35 +1,37 @@
 import { useState } from 'react';
 import { useData } from '../context/DataContext';
+import { setParams } from '../api/bridge';
 import PositionReadingCard from '../components/PositionReadingCard';
 import PositionSelector from '../components/PositionSelector';
-import { allPositionsComplete } from '../types';
-import type { Position, PositionReading } from '../types';
+import { allPositionsComplete, COMMON_BPH, EVALUATION_STATE_LABELS, formatRate } from '../types';
+import type { Position, PositionReading, Navigate } from '../types';
 
 interface Props {
   evaluationId: string;
-  onNavigate: (page: string, params?: Record<string, string>) => void;
+  onNavigate: Navigate;
 }
 
 export default function EvaluationPage({ evaluationId, onNavigate }: Props) {
-  const { evaluations, positionReadings, updateEvaluation, addPositionReading } = useData();
+  const { evaluations, positionReadings, addPositionReading, updateEvaluation, transitionEvaluation, setEvaluationBph } = useData();
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
+  const [editingName, setEditingName] = useState(false);
+  const [nameInput, setNameInput] = useState('');
 
   const evaluation = evaluations.find((e) => e.id === evaluationId);
   const readings = positionReadings.filter((r) => r.evaluation_id === evaluationId);
-  const [editingName, setEditingName] = useState(false);
-  const [nameInput, setNameInput] = useState('');
 
   if (!evaluation) {
     return (
       <div className="page">
         <p>Evaluation not found.</p>
-        <button className="btn-secondary" onClick={() => onNavigate('home')}>
+        <button className="btn-secondary" onClick={() => onNavigate({ name: 'home' })}>
           Back
         </button>
       </div>
     );
   }
 
+  const completeReadings = readings.filter((r) => r.state === 'complete' && r.rate_spd !== null);
   const completedCount = readings.filter((r) => r.state === 'complete').length;
   const isComplete = evaluation.state === 'complete';
 
@@ -37,23 +39,21 @@ export default function EvaluationPage({ evaluationId, onNavigate }: Props) {
     if (!selectedPosition) return;
 
     if (evaluation.state === 'draft') {
-      evaluation.state = 'in_progress';
-      updateEvaluation(evaluation);
+      transitionEvaluation(evaluationId, 'in_progress');
     }
 
     const reading = addPositionReading(evaluationId, selectedPosition);
-    onNavigate('capture', { readingId: reading.id, evaluationId });
+    onNavigate({ name: 'capture', readingId: reading.id, evaluationId });
   };
 
   const handleRetry = (reading: PositionReading) => {
     const newReading = addPositionReading(evaluationId, reading.position);
-    onNavigate('capture', { readingId: newReading.id, evaluationId });
+    onNavigate({ name: 'capture', readingId: newReading.id, evaluationId });
   };
 
   const handleFinish = () => {
     if (evaluation.state === 'in_progress' && completedCount > 0) {
-      evaluation.state = 'complete';
-      updateEvaluation(evaluation);
+      transitionEvaluation(evaluationId, 'complete');
     }
   };
 
@@ -65,30 +65,28 @@ export default function EvaluationPage({ evaluationId, onNavigate }: Props) {
     setEditingName(false);
   };
 
+  const handleBphChange = async (bph: number) => {
+    setEvaluationBph(evaluationId, bph);
+    try {
+      await setParams({ bph });
+    } catch {
+      // ignore bridge errors
+    }
+  };
+
   const canFinish = evaluation.state === 'in_progress' && completedCount > 0 && !allPositionsComplete(readings);
-  const autoCompleteReached = allPositionsComplete(readings) && evaluation.state === 'in_progress';
 
-  if (autoCompleteReached && !isComplete) {
-    evaluation.state = 'complete';
-    updateEvaluation(evaluation);
-  }
+  const avgRate = completeReadings.length > 0
+    ? completeReadings.reduce((sum, r) => sum + (r.rate_spd as number), 0) / completeReadings.length
+    : null;
 
-  const avgRate =
-    completedCount > 0
-      ? readings
-          .filter((r) => r.state === 'complete' && r.rate_spd !== null)
-          .reduce((sum, r) => sum + (r.rate_spd ?? 0), 0) / completedCount
-      : null;
-
-  const completeRates = readings
-    .filter((r) => r.state === 'complete' && r.rate_spd !== null)
-    .map((r) => r.rate_spd as number);
+  const completeRates = completeReadings.map((r) => r.rate_spd as number);
   const maxPosError = completeRates.length >= 2 ? Math.max(...completeRates) - Math.min(...completeRates) : null;
 
   return (
     <div className="page">
       <header className="page-header">
-        <button className="btn-secondary" onClick={() => onNavigate('watch', { watchId: evaluation.watch_id })}>
+        <button className="btn-secondary" onClick={() => onNavigate({ name: 'watch', watchId: evaluation.watch_id })}>
           &larr; Back
         </button>
         {editingName ? (
@@ -114,12 +112,27 @@ export default function EvaluationPage({ evaluationId, onNavigate }: Props) {
           </h1>
         )}
         <span className={`badge badge-${evaluation.state}`}>
-          {evaluation.state === 'draft' ? 'Draft' : evaluation.state === 'in_progress' ? 'In Progress' : 'Complete'}
+          {EVALUATION_STATE_LABELS[evaluation.state]}
         </span>
         <p className="muted">
           {completedCount}/5 positions completed
         </p>
-        {evaluation.bph && <p className="muted">BPH: {evaluation.bph}</p>}
+        {evaluation.state !== 'draft' && (
+          <div className="bph-control">
+            <label>BPH</label>
+            <select
+              value={evaluation.bph ?? 28800}
+              onChange={(e) => handleBphChange(Number(e.target.value))}
+              disabled={isComplete}
+            >
+              {COMMON_BPH.map((bph) => (
+                <option key={bph} value={bph}>
+                  {bph}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
       </header>
 
       {evaluation.state === 'complete' && (
@@ -128,7 +141,7 @@ export default function EvaluationPage({ evaluationId, onNavigate }: Props) {
           {avgRate !== null && (
             <div className="summary-stat">
               <span className="stat-label">Average Rate</span>
-              <span className="stat-value">{avgRate >= 0 ? '+' : ''}{avgRate.toFixed(1)} s/d</span>
+              <span className="stat-value">{formatRate(avgRate)}</span>
             </div>
           )}
           {maxPosError !== null && (
@@ -173,7 +186,7 @@ export default function EvaluationPage({ evaluationId, onNavigate }: Props) {
               isSelected={false}
               onSelect={() => {
                 if (r.state === 'recording' || r.state === 'failed') {
-                  onNavigate('capture', { readingId: r.id, evaluationId });
+                  onNavigate({ name: 'capture', readingId: r.id, evaluationId });
                 }
               }}
               onRetry={handleRetry}

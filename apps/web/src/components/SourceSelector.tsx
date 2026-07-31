@@ -12,10 +12,9 @@ interface SourceState {
 
 interface Props {
   disabled?: boolean;
-  onSourceChange?: () => void;
 }
 
-export default function SourceSelector({ disabled, onSourceChange }: Props) {
+export default function SourceSelector({ disabled }: Props) {
   const [state, setState] = useState<SourceState>({
     sourceType: 'mic',
     deviceName: '',
@@ -42,7 +41,6 @@ export default function SourceSelector({ disabled, onSourceChange }: Props) {
         await setSource({ type: 'file', path: state.filePath, loop: state.loopPlayback });
       }
       setMessage('Source set');
-      onSourceChange?.();
     } catch (err) {
       setMessage(err instanceof Error ? err.message : 'Failed to set source');
     } finally {

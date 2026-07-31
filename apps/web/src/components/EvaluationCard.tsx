@@ -1,4 +1,5 @@
 import type { Evaluation } from '../types';
+import { EVALUATION_STATE_LABELS } from '../types';
 
 interface Props {
   evaluation: Evaluation;
@@ -7,12 +8,6 @@ interface Props {
   onClick: (evaluation: Evaluation) => void;
   onDelete: (id: string) => void;
 }
-
-const stateLabels: Record<string, string> = {
-  draft: 'Draft',
-  in_progress: 'In Progress',
-  complete: 'Complete',
-};
 
 export default function EvaluationCard({
   evaluation,
@@ -25,7 +20,7 @@ export default function EvaluationCard({
     <div className="card evaluation-card" onClick={() => onClick(evaluation)}>
       <div className="card-body">
         <h3>{evaluation.name}</h3>
-        <span className={`badge badge-${evaluation.state}`}>{stateLabels[evaluation.state]}</span>
+        <span className={`badge badge-${evaluation.state}`}>{EVALUATION_STATE_LABELS[evaluation.state]}</span>
         <p className="muted">
           {completedCount}/{positionCount} positions complete
         </p>

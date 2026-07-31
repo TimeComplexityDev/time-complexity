@@ -1,32 +1,11 @@
 import type { PositionReading } from '../types';
-import { getPositionName } from '../types';
+import { getPositionName, READING_STATE_LABELS, formatRate, formatBeatError, formatAmplitude } from '../types';
 
 interface Props {
   reading: PositionReading;
   isSelected: boolean;
   onSelect: (reading: PositionReading) => void;
   onRetry: (reading: PositionReading) => void;
-}
-
-const stateLabels: Record<string, string> = {
-  recording: 'Recording...',
-  complete: 'Complete',
-  failed: 'Failed',
-};
-
-function formatRate(rate: number | null): string {
-  if (rate === null) return '—';
-  return `${rate >= 0 ? '+' : ''}${rate.toFixed(1)} s/d`;
-}
-
-function formatBeatError(be: number | null): string {
-  if (be === null) return '—';
-  return `${(be * 1000).toFixed(2)} ms`;
-}
-
-function formatAmplitude(amp: number | null): string {
-  if (amp === null) return '—';
-  return `${amp.toFixed(0)}°`;
 }
 
 export default function PositionReadingCard({ reading, isSelected, onSelect, onRetry }: Props) {
@@ -37,7 +16,7 @@ export default function PositionReadingCard({ reading, isSelected, onSelect, onR
     >
       <div className="card-body">
         <h4>{getPositionName(reading.position)}</h4>
-        <span className={`badge badge-${reading.state}`}>{stateLabels[reading.state]}</span>
+        <span className={`badge badge-${reading.state}`}>{READING_STATE_LABELS[reading.state]}</span>
         {reading.state === 'complete' && (
           <div className="stats">
             <div className="stat">

@@ -63,6 +63,28 @@ export interface AggregateUpdate {
 
 export type StreamMessage = TickEvent | AggregateUpdate;
 
+export type Page =
+  | { name: 'home' }
+  | { name: 'watch'; watchId: string }
+  | { name: 'evaluation'; evaluationId: string }
+  | { name: 'capture'; readingId: string; evaluationId: string };
+
+export type Navigate = (page: Page) => void;
+
+export const EVALUATION_STATE_LABELS: Record<string, string> = {
+  draft: 'Draft',
+  in_progress: 'In Progress',
+  complete: 'Complete',
+};
+
+export const READING_STATE_LABELS: Record<string, string> = {
+  recording: 'Recording...',
+  complete: 'Complete',
+  failed: 'Failed',
+};
+
+export const COMMON_BPH = [18000, 19800, 21600, 25200, 28800, 36000];
+
 export function computeDefaultEvaluationName(watchName: string): string {
   const now = new Date();
   const date = now.toISOString().slice(0, 10);
@@ -87,4 +109,19 @@ export function getPositionName(position: Position): string {
     'crown right': 'Crown Right',
   };
   return names[position];
+}
+
+export function formatRate(v: number | null): string {
+  if (v === null) return '—';
+  return `${v >= 0 ? '+' : ''}${v.toFixed(1)} s/d`;
+}
+
+export function formatBeatError(v: number | null): string {
+  if (v === null) return '—';
+  return `${(v * 1000).toFixed(2)} ms`;
+}
+
+export function formatAmplitude(v: number | null): string {
+  if (v === null) return '—';
+  return `${v.toFixed(0)}°`;
 }

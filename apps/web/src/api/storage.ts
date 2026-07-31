@@ -22,20 +22,28 @@ function write<T>(key: string, value: T): void {
   localStorage.setItem(key, JSON.stringify(value));
 }
 
+function list<T>(key: string): T[] {
+  return read<T[]>(key, []);
+}
+
+function upsert<T extends { id: string }>(key: string, item: T): void {
+  const items = list<T>(key);
+  const idx = items.findIndex((i) => i.id === item.id);
+  if (idx >= 0) {
+    items[idx] = item;
+  } else {
+    items.push(item);
+  }
+  write(key, items);
+}
+
 // Watches
 export function getWatches(): Watch[] {
-  return read<Watch[]>(KEYS.watches, []);
+  return list<Watch>(KEYS.watches);
 }
 
 export function saveWatch(watch: Watch): void {
-  const watches = getWatches();
-  const idx = watches.findIndex((w) => w.id === watch.id);
-  if (idx >= 0) {
-    watches[idx] = watch;
-  } else {
-    watches.push(watch);
-  }
-  write(KEYS.watches, watches);
+  upsert(KEYS.watches, watch);
 }
 
 export function deleteWatch(id: string): void {
@@ -50,7 +58,7 @@ export function deleteWatch(id: string): void {
 
 // Evaluations
 export function getEvaluations(): Evaluation[] {
-  return read<Evaluation[]>(KEYS.evaluations, []);
+  return list<Evaluation>(KEYS.evaluations);
 }
 
 export function getEvaluationsForWatch(watchId: string): Evaluation[] {
@@ -58,14 +66,7 @@ export function getEvaluationsForWatch(watchId: string): Evaluation[] {
 }
 
 export function saveEvaluation(evaluation: Evaluation): void {
-  const evaluations = getEvaluations();
-  const idx = evaluations.findIndex((e) => e.id === evaluation.id);
-  if (idx >= 0) {
-    evaluations[idx] = evaluation;
-  } else {
-    evaluations.push(evaluation);
-  }
-  write(KEYS.evaluations, evaluations);
+  upsert(KEYS.evaluations, evaluation);
 }
 
 export function deleteEvaluation(id: string): void {
@@ -77,7 +78,7 @@ export function deleteEvaluation(id: string): void {
 
 // Position Readings
 export function getPositionReadings(): PositionReading[] {
-  return read<PositionReading[]>(KEYS.positionReadings, []);
+  return list<PositionReading>(KEYS.positionReadings);
 }
 
 export function getPositionReadingsForEvaluation(evaluationId: string): PositionReading[] {
@@ -85,14 +86,7 @@ export function getPositionReadingsForEvaluation(evaluationId: string): Position
 }
 
 export function savePositionReading(reading: PositionReading): void {
-  const readings = getPositionReadings();
-  const idx = readings.findIndex((r) => r.id === reading.id);
-  if (idx >= 0) {
-    readings[idx] = reading;
-  } else {
-    readings.push(reading);
-  }
-  write(KEYS.positionReadings, readings);
+  upsert(KEYS.positionReadings, reading);
 }
 
 export function deletePositionReading(id: string): void {
@@ -116,7 +110,9 @@ export function clearPairToken(): void {
 // Bridge port
 export function getBridgePort(): number {
   const raw = localStorage.getItem(KEYS.bridgePort);
-  return raw ? parseInt(raw, 10) : 9001;
+  if (raw === null) return 9001;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 9001;
 }
 
 export function setBridgePort(port: number): void {

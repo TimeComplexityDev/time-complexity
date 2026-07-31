@@ -5,16 +5,16 @@ import { startCapture, stopCapture, setParams, getStatus, connectStream } from '
 import TickStream from '../components/TickStream';
 import AggregateGauges from '../components/AggregateGauges';
 import SourceSelector from '../components/SourceSelector';
-import type { TickEvent, AggregateUpdate, StreamMessage } from '../types';
+import type { TickEvent, AggregateUpdate, StreamMessage, Navigate } from '../types';
 
 interface Props {
   readingId: string;
   evaluationId: string;
-  onNavigate: (page: string, params?: Record<string, string>) => void;
+  onNavigate: Navigate;
 }
 
 export default function CapturePage({ readingId, evaluationId, onNavigate }: Props) {
-  const { positionReadings, updatePositionReading, evaluations, updateEvaluation } = useData();
+  const { positionReadings, evaluations, transitionEvaluation, markReadingComplete, markReadingFailed, setEvaluationBph } = useData();
   const { isPaired } = usePairing();
 
   const [ticks, setTicks] = useState<TickEvent[]>([]);
@@ -22,6 +22,7 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const isRecordingRef = useRef(false);
 
   const reading = positionReadings.find((r) => r.id === readingId);
   const evaluation = evaluations.find((e) => e.id === evaluationId);
@@ -36,12 +37,12 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
 
   const handleWsError = useCallback(() => {
     setError('WebSocket connection lost');
-    if (reading && reading.state === 'recording') {
-      reading.state = 'failed';
-      updatePositionReading(reading);
+    if (readingId) {
+      markReadingFailed(readingId);
     }
     setIsRecording(false);
-  }, [reading, updatePositionReading]);
+    isRecordingRef.current = false;
+  }, [readingId, markReadingFailed]);
 
   const handleStart = async () => {
     if (!isPaired) {
@@ -56,22 +57,16 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
       if (evaluation?.bph) {
         await setParams({ bph: evaluation.bph });
       }
-      const result = await startCapture();
+      await startCapture();
       setIsRecording(true);
-
-      if (reading) {
-        reading.session_id = result.session_id;
-        reading.state = 'recording';
-        updatePositionReading(reading);
-      }
+      isRecordingRef.current = true;
 
       if (evaluation && evaluation.state === 'draft') {
-        evaluation.state = 'in_progress';
-        updateEvaluation(evaluation);
+        transitionEvaluation(evaluationId, 'in_progress');
       }
 
       wsRef.current = connectStream(handleMessage, handleWsError, () => {
-        if (isRecording) {
+        if (isRecordingRef.current) {
           handleWsError();
         }
       });
@@ -90,23 +85,22 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
       }
 
       if (reading && aggregate) {
-        reading.state = 'complete';
-        reading.rate_spd = aggregate.long_ewma_spd;
-        reading.beat_error_s = aggregate.beat_error_s;
-        reading.amplitude = aggregate.amplitude;
-        reading.completed_at = new Date().toISOString();
-        updatePositionReading(reading);
+        markReadingComplete(readingId, {
+          rate_spd: aggregate.long_ewma_spd,
+          beat_error_s: aggregate.beat_error_s,
+          amplitude: aggregate.amplitude,
+        });
 
         // Lock BPH on first reading
         if (evaluation && !evaluation.bph) {
           const status = await getStatus();
-          evaluation.bph = status.bph;
-          updateEvaluation(evaluation);
+          setEvaluationBph(evaluationId, status.bph);
         }
       }
 
       setIsRecording(false);
-      onNavigate('evaluation', { evaluationId });
+      isRecordingRef.current = false;
+      onNavigate({ name: 'evaluation', evaluationId });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to stop capture');
     }
@@ -124,7 +118,7 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
     return (
       <div className="page">
         <p>Position reading not found.</p>
-        <button className="btn-secondary" onClick={() => onNavigate('evaluation', { evaluationId })}>
+        <button className="btn-secondary" onClick={() => onNavigate({ name: 'evaluation', evaluationId })}>
           Back
         </button>
       </div>
@@ -134,7 +128,7 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
   return (
     <div className="page">
       <header className="page-header">
-        <button className="btn-secondary" onClick={() => onNavigate('evaluation', { evaluationId })}>
+        <button className="btn-secondary" onClick={() => onNavigate({ name: 'evaluation', evaluationId })}>
           &larr; Back
         </button>
         <h1>Capture: {reading.position}</h1>
