@@ -696,6 +696,12 @@ async fn start_handler(
         }
     }
 
+    // Reset pipeline state before starting a new measurement
+    {
+        let s = state.read().await;
+        s.pipeline.lock().unwrap().reset();
+    }
+
     let capture = {
         let s = state.read().await;
         let pipe = s.pipeline.clone();
@@ -811,11 +817,18 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                let (new_ticks, bph_detected, detected_bph, bph_override) = {
+                let (new_ticks, bph_detected, detected_bph, bph_override, current_session_id) = {
                     let guard = state.read().await;
                     let p = guard.pipeline.lock().unwrap();
-                    (p.ticks.clone(), p.bph_detected, p.detected_bph, guard.bph_override)
+                    (p.ticks.clone(), p.bph_detected, p.detected_bph, guard.bph_override, guard.session.session_id.clone())
                 };
+
+                // Reset metrics engine when a new measurement starts
+                if let Some(ref sid) = current_session_id {
+                    if sid != metrics.session_id() {
+                        metrics = metrics::MetricsEngine::new(sid.clone(), sample_rate);
+                    }
+                }
 
                 let bph = bph_override.unwrap_or(detected_bph);
                 if bph != metrics.bph() {

@@ -87,6 +87,22 @@ impl MetricsEngine {
         self.bph
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        self.last_sent_tick = 0;
+        self.half_periods.clear();
+        self.short_window_rates.clear();
+        self.long_ewma = None;
+        self.last_beat_error = 0.0;
+        self.last_amplitude = 0.0;
+        self.last_instant_rate = 0.0;
+        self.pending_messages.clear();
+    }
+
     pub fn ingest_ticks(&mut self, ticks: &[TickEvent]) {
         let ticks_per_sec = self.bph as f64 / 3600.0;
         let window_samples = (self.short_window_duration * ticks_per_sec).ceil() as usize;
@@ -249,6 +265,43 @@ mod tests {
                 "tick {} rate={:.2} s/d, expected ~+12 s/d for +12 s/d drift",
                 msg.tick_index,
                 msg.rate_spd,
+            );
+        }
+    }
+
+    #[test]
+    fn test_reset_clears_state() {
+        let mut engine = MetricsEngine::new("test".into(), 44100.0);
+        engine.set_bph(21600);
+        let nominal = 3600.0 / 21600.0;
+
+        let ticks: Vec<TickEvent> = (1..=30)
+            .map(|i| make_tick(i, nominal, 0.5))
+            .collect();
+
+        engine.ingest_ticks(&ticks);
+        let (msgs, _) = engine.drain_messages();
+        assert!(!msgs.is_empty(), "expected tick messages before reset");
+
+        // After reset, drain should yield nothing (messages cleared, last_sent_tick=0)
+        engine.reset();
+
+        let (msgs2, _) = engine.drain_messages();
+        assert!(msgs2.is_empty(), "pending messages not cleared by reset");
+
+        // Re-ingest same ticks — should re-process from tick_index 0
+        engine.ingest_ticks(&ticks);
+        let (msgs3, _) = engine.drain_messages();
+        assert_eq!(
+            msgs3.len(), msgs.len(),
+            "after reset, re-ingesting same ticks should produce same number of messages ({} vs {})",
+            msgs3.len(), msgs.len(),
+        );
+        for msg in &msgs3 {
+            assert!(
+                msg.rate_spd.abs() < 0.01,
+                "tick {} rate={:.4} s/d after reset (expected ~0)",
+                msg.tick_index, msg.rate_spd,
             );
         }
     }

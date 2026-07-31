@@ -276,6 +276,23 @@ impl DspPipeline {
         self.bandpass = BiquadFilter::bandpass(self.sample_rate, freq, q);
     }
 
+    pub fn reset(&mut self) {
+        self.bandpass = BiquadFilter::bandpass(self.sample_rate, self.config.bandpass_freq, self.config.bandpass_q);
+        self.envelope_lowpass = BiquadFilter::lowpass(self.sample_rate, self.config.envelope_cutoff, 1.0);
+        self.adaptive = AdaptiveThreshold::new(8, 0.5, self.sample_rate);
+        self.refractory_samples = Self::compute_refractory(self.sample_rate).max(1);
+        self.sample_index = 0;
+        self.prev_envelope = 0.0;
+        self.prev_prev_envelope = 0.0;
+        self.samples_since_peak = usize::MAX;
+        self.peak_count = 0;
+        self.last_peak_sample = 0;
+        self.interval_history.clear();
+        self.detected_bph = DEFAULT_BPH;
+        self.bph_detected = false;
+        self.ticks.clear();
+    }
+
     pub fn process_samples(&mut self, samples: &[f32]) {
         for &raw in samples {
             let bandpassed = self.bandpass.process(raw as f64);
@@ -451,6 +468,7 @@ impl TickSimulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{MetricsEngine, TickEventMessage};
 
     #[test]
     fn test_parabolic_peak_symmetric() {
@@ -630,6 +648,291 @@ mod tests {
             (mean_rate - 12.0).abs() < 3.0,
             "expected mean rate ~+12 s/d, got {:.2}",
             mean_rate,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for comprehensive integration tests
+    // -----------------------------------------------------------------------
+
+    /// Pick a sample rate where `sr / (bph/3600)` is an integer, so the
+    /// simulator produces zero-jitter ticks (exact sample positions).
+    fn compatible_sr(bph: u16) -> u32 {
+        match bph {
+            18000 => 44100,  // 44100/5 = 8820
+            19800 => 44000,  // 44000/5.5 = 8000
+            21600 => 44100,  // 44100/6 = 7350
+            25200 => 44100,  // 44100/7 = 6300
+            28800 => 48000,  // 48000/8 = 6000
+            36000 => 44100,  // 44100/10 = 4410
+            _ => 44100,
+        }
+    }
+
+    struct SimResult {
+        ticks: Vec<TickEvent>,
+        detected_bph: u32,
+        bph_detected: bool,
+    }
+
+    fn run_simulation(bph: u16, drift_spd: f64, beat_error_ms: f64, sr: u32, duration_sec: f64) -> SimResult {
+        let mut sim = TickSimulator::new(
+            SimulatorParams { bph, drift_s_per_day: drift_spd, beat_error_ms },
+            sr,
+        );
+        let mut p = DspPipeline::new(sr as f64);
+        let total_samples = (sr as f64 * duration_sec) as usize;
+        let mut samples = vec![0.0f32; total_samples];
+        sim.generate_samples(&mut samples);
+        p.process_samples(&samples);
+        SimResult {
+            ticks: p.ticks,
+            detected_bph: p.detected_bph,
+            bph_detected: p.bph_detected,
+        }
+    }
+
+    /// Full-pipeline simulation result processed through MetricsEngine.
+    struct MetricsSimResult {
+        tick_msgs: Vec<TickEventMessage>,
+    }
+
+    fn run_simulation_with_metrics(
+        bph: u16, drift_spd: f64, beat_error_ms: f64,
+        sr: u32, duration_sec: f64,
+    ) -> MetricsSimResult {
+        let sim = run_simulation(bph, drift_spd, beat_error_ms, sr, duration_sec);
+        let mut engine = MetricsEngine::new("test-sim".into(), sr as f64);
+        engine.set_bph(sim.detected_bph);
+        engine.ingest_ticks(&sim.ticks);
+        let (tick_msgs, _aggregate) = engine.drain_messages();
+        MetricsSimResult { tick_msgs }
+    }
+
+    // -----------------------------------------------------------------------
+    // BPH auto-detection — every common BPH
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bph_auto_detect_all_common() {
+        for &bph in &[18000u16, 19800, 21600, 25200, 28800, 36000] {
+            let sr = compatible_sr(bph);
+            let result = run_simulation(bph, 0.0, 0.0, sr, 5.0);
+            assert!(result.bph_detected, "BPH auto-detect should complete for {} BPH", bph);
+            assert_eq!(
+                result.detected_bph, bph as u32,
+                "BPH auto-detect mismatch for {} BPH (got {})",
+                bph, result.detected_bph,
+            );
+            assert!(result.ticks.len() >= 5, "too few ticks for {} BPH: {}", bph, result.ticks.len());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Zero drift — all common BPH values, per-tick rate accuracy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_zero_drift_all_common_bph() {
+        for &bph in &[18000u16, 19800, 21600, 25200, 28800, 36000] {
+            let sr = compatible_sr(bph);
+            let result = run_simulation(bph, 0.0, 0.0, sr, 5.0);
+            let nominal = 3600.0 / bph as f64;
+
+            for tick in result.ticks.iter().skip(1) {
+                let rate = (tick.interval - nominal) / nominal * 86400.0;
+                assert!(
+                    rate.abs() < 0.5,
+                    "{} BPH zero drift: tick {} rate={:+.2} s/d (interval {:.6}s, nominal {:.6}s)",
+                    bph, tick.tick_index, rate, tick.interval, nominal,
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Known drift values — all common BPH, per-tick rate matches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_drift_rates_all_common_bph() {
+        // Use higher sample rates to minimize simulator quantization error.
+        // At sr/tick_samples, the quantization is ±0.5 samples per tick,
+        // which translates to ±0.5 / tick_samples * 86400 s/d.
+        let drifts: &[(f64, f64)] = &[(5.0, 3.0), (-5.0, 3.0), (12.0, 5.0), (-10.0, 5.0)];
+
+        for &bph in &[18000u16, 21600, 28800, 36000] {
+            // Use 96000 Hz for all drift tests — better quantization precision
+            let sr = match bph {
+                18000 => 96000u32,  // 96000/5 = 19200 samples/tick
+                19800 => 88000u32,  // 88000/5.5 = 16000 samples/tick
+                21600 => 96000u32,  // 96000/6 = 16000 samples/tick
+                25200 => 88200u32,  // 88200/7 = 12600 samples/tick
+                28800 => 96000u32,  // 96000/8 = 12000 samples/tick
+                36000 => 96000u32,  // 96000/10 = 9600 samples/tick
+                _ => 96000,
+            };
+            let nominal = 3600.0 / bph as f64;
+            let samples_per_tick = sr as f64 / (bph as f64 / 3600.0);
+
+            for &(drift_spd, base_tol) in drifts {
+                let result = run_simulation(bph, drift_spd, 0.0, sr, 8.0);
+                let ticks = &result.ticks;
+
+                let data_ticks: Vec<&TickEvent> = ticks.iter().skip(5).collect();
+                if data_ticks.is_empty() {
+                    continue;
+                }
+
+                let mean_interval: f64 = data_ticks.iter().map(|t| t.interval).sum::<f64>()
+                    / data_ticks.len() as f64;
+                let mean_rate = (mean_interval - nominal) / nominal * 86400.0;
+
+                // Tolerance: base tolerance + quantization uncertainty
+                // (±0.5 sample per tick expressed in s/d)
+                let quanta = 0.5 / samples_per_tick * 86400.0;
+                let tol = base_tol + quanta * 1.5;
+
+                assert!(
+                    (mean_rate - drift_spd).abs() < tol,
+                    "{} BPH + {:.0} s/d drift: mean_rate={:.2} s/d, expected ~{:.0} (tol {:.1}, quanta {:.2})",
+                    bph, drift_spd, mean_rate, drift_spd, tol, quanta,
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Beat error detection — known beat error, measured beat error matches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_beat_error_detection() {
+        for &bph in &[18000u16, 21600, 28800] {
+            let sr = compatible_sr(bph);
+            let result = run_simulation(bph, 0.0, 1.5, sr, 8.0);
+            let ticks = &result.ticks;
+
+            let diffs: Vec<f64> = ticks.iter().skip(1)
+                .map(|t| t.interval)
+                .collect();
+
+            if diffs.len() < 4 {
+                continue;
+            }
+
+            // Beat error = |tic - toc| = |even_interval - odd_interval|
+            let mut beat_errors = Vec::new();
+            for pair_ix in (0..diffs.len() - 1).step_by(2) {
+                if pair_ix + 1 < diffs.len() {
+                    beat_errors.push((diffs[pair_ix] - diffs[pair_ix + 1]).abs());
+                }
+            }
+
+            if beat_errors.is_empty() {
+                continue;
+            }
+            let mean_beat_error_s: f64 = beat_errors.iter().sum::<f64>() / beat_errors.len() as f64;
+            let mean_beat_error_ms = mean_beat_error_s * 1000.0;
+
+            assert!(
+                (mean_beat_error_ms - 1.5).abs() < 1.0,
+                "{} BPH beat error: measured {:.2} ms, expected ~1.5 ms",
+                bph, mean_beat_error_ms,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Measurement cycle with reset — simulate full position readings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_clears_pipeline_state() {
+        // Measurement 1: 21600 BPH, +5 s/d
+        let sr = 44100;
+        let mut sim = TickSimulator::new(
+            SimulatorParams { bph: 21600, drift_s_per_day: 5.0, beat_error_ms: 0.0 },
+            sr,
+        );
+        let mut p = DspPipeline::new(sr as f64);
+        let mut buf = vec![0.0f32; (sr as f64 * 5.0) as usize];
+        sim.generate_samples(&mut buf);
+        p.process_samples(&buf);
+
+        assert_eq!(p.detected_bph, 21600);
+        assert!(p.bph_detected);
+        assert!(p.ticks.len() >= 25);
+
+        // Reset — as if user started a new measurement
+        p.reset();
+
+        assert!(p.ticks.is_empty(), "ticks not cleared");
+        assert!(!p.bph_detected, "bph_detected not reset");
+        assert_eq!(p.detected_bph, 28800, "detected_bph not reset to default");
+        assert_eq!(p.peak_count, 0, "peak_count not reset");
+
+        // Measurement 2: 28800 BPH, -3 s/d drift
+        let mut sim2 = TickSimulator::new(
+            SimulatorParams { bph: 28800, drift_s_per_day: -3.0, beat_error_ms: 0.0 },
+            sr,
+        );
+        sim2.generate_samples(&mut buf);
+        p.process_samples(&buf);
+
+        assert_eq!(
+            p.detected_bph, 28800,
+            "after reset, second measurement should detect 28800 BPH, got {}",
+            p.detected_bph,
+        );
+        assert!(p.bph_detected);
+
+        let nominal = 3600.0 / 28800.0;
+        let mean_interval: f64 = p.ticks.iter().skip(1).map(|t| t.interval).sum::<f64>()
+            / (p.ticks.len().saturating_sub(1)) as f64;
+        let mean_rate = (mean_interval - nominal) / nominal * 86400.0;
+        assert!(
+            mean_rate < 0.0,
+            "after reset, -3 s/d drift should give negative rate, got {:.2}",
+            mean_rate,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-pipeline through MetricsEngine — validates rate computation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_full_pipeline_through_metrics_engine() {
+        let result = run_simulation_with_metrics(21600, 0.0, 0.0, 44100, 8.0);
+
+        assert!(!result.tick_msgs.is_empty(), "should produce tick messages");
+
+        // With zero drift, every tick message's rate should be ~0
+        for msg in &result.tick_msgs {
+            assert!(
+                msg.rate_spd.abs() < 0.5,
+                "tick {}: rate={:+.2} s/d (expected ~0 for zero-drift)",
+                msg.tick_index,
+                msg.rate_spd,
+            );
+        }
+    }
+
+    #[test]
+    fn test_full_pipeline_drift_through_metrics_engine() {
+        let result = run_simulation_with_metrics(21600, 8.0, 0.0, 44100, 10.0);
+
+        assert!(!result.tick_msgs.is_empty(), "should produce tick messages");
+
+        let mut rates: Vec<f64> = result.tick_msgs.iter().map(|m| m.rate_spd).collect();
+        rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_rate = rates[rates.len() / 2];
+
+        assert!(
+            (median_rate - 8.0).abs() < 4.0,
+            "median rate={:.2} s/d, expected ~8 s/d",
+            median_rate,
         );
     }
 }
