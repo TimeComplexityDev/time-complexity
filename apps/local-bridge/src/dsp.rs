@@ -223,6 +223,7 @@ pub struct DspPipeline {
     /// Observed intervals for BPH auto-detect (capped at 10)
     interval_history: VecDeque<f64>,
     pub detected_bph: u32,
+    pub bph_detected: bool,
 
     pub ticks: Vec<TickEvent>,
 }
@@ -249,6 +250,7 @@ impl DspPipeline {
             last_peak_sample: 0,
             interval_history: VecDeque::with_capacity(10),
             detected_bph: DEFAULT_BPH,
+            bph_detected: false,
             ticks: Vec::new(),
         }
     }
@@ -331,6 +333,7 @@ impl DspPipeline {
                     avg_interval * self.sample_rate,
                     self.sample_rate,
                 );
+                self.bph_detected = true;
                 // Update refractory period to match detected BPH
                 let half_period = 3600.0 / self.detected_bph as f64;
                 self.refractory_samples = (REFRACTORY_FRACTION * half_period * self.sample_rate).max(1.0) as usize;
@@ -533,18 +536,65 @@ mod tests {
         );
 
         assert_eq!(p.detected_bph, 21600, "BPH should be detected as 21600");
+    }
 
-        let mean_interval: f64 = p.ticks.iter().skip(1).map(|t| t.interval).sum::<f64>()
-            / (p.ticks.len().saturating_sub(1)) as f64;
-        let expected_interval = 1.0 / (21600.0 / 3600.0);
-        let tolerance = expected_interval * 0.02;
-        assert!(
-            (mean_interval - expected_interval).abs() < tolerance,
-            "mean interval {:.6}s, expected {:.6}s ± {:.6}s",
-            mean_interval,
-            expected_interval,
-            tolerance,
+    #[test]
+    fn test_simulator_zero_drift_rate() {
+        let sr = 44100;
+        let mut sim = TickSimulator::new(
+            SimulatorParams { bph: 21600, drift_s_per_day: 0.0, beat_error_ms: 0.0 },
+            sr,
         );
+        let mut p = DspPipeline::new(sr as f64);
+
+        let total_samples = (sr as f64 * 5.0) as usize;
+        let mut samples = vec![0.0f32; total_samples];
+        sim.generate_samples(&mut samples);
+        p.process_samples(&samples);
+
+        let nominal_interval = 1.0 / (21600.0 / 3600.0);
+
+        for tick in p.ticks.iter().skip(1) {
+            let rate_spd = (tick.interval - nominal_interval) / nominal_interval * 86400.0;
+            assert!(
+                rate_spd.abs() < 0.1,
+                "tick {} interval {:.6}s > nominal {:.6}s, rate={:+.2} s/d (expected ~0)",
+                tick.tick_index,
+                tick.interval,
+                nominal_interval,
+                rate_spd,
+            );
+        }
+    }
+
+    #[test]
+    fn test_simulator_28800_bph_zero_drift() {
+        let sr = 48000;
+        let mut sim = TickSimulator::new(
+            SimulatorParams { bph: 28800, drift_s_per_day: 0.0, beat_error_ms: 0.0 },
+            sr,
+        );
+        let mut p = DspPipeline::new(sr as f64);
+
+        let total_samples = (sr as f64 * 5.0) as usize;
+        let mut samples = vec![0.0f32; total_samples];
+        sim.generate_samples(&mut samples);
+        p.process_samples(&samples);
+
+        assert!(p.ticks.len() >= 35, "expected at least 35 ticks for 28800 BPH @ 5s");
+
+        let nominal_interval = 1.0 / (28800.0 / 3600.0);
+
+        for tick in p.ticks.iter().skip(1) {
+            let rate_spd = (tick.interval - nominal_interval) / nominal_interval * 86400.0;
+            assert!(
+                rate_spd.abs() < 0.1,
+                "tick {}: interval {:.6}s, rate={:+.2} s/d",
+                tick.tick_index,
+                tick.interval,
+                rate_spd,
+            );
+        }
     }
 
     #[test]
@@ -573,6 +623,13 @@ mod tests {
             "drift of +12 s/day should increase interval (got {:.6}s, nominal {:.6}s)",
             mean_interval,
             nominal_interval,
+        );
+
+        let mean_rate = (mean_interval - nominal_interval) / nominal_interval * 86400.0;
+        assert!(
+            (mean_rate - 12.0).abs() < 3.0,
+            "expected mean rate ~+12 s/d, got {:.2}",
+            mean_rate,
         );
     }
 }

@@ -73,8 +73,18 @@ impl MetricsEngine {
     }
 
     pub fn set_bph(&mut self, bph: u32) {
+        if self.bph == bph {
+            return;
+        }
         self.bph = bph;
         self.nominal_interval = 3600.0 / bph as f64;
+        self.short_window_rates.clear();
+        self.long_ewma = None;
+        self.last_instant_rate = 0.0;
+    }
+
+    pub fn bph(&self) -> u32 {
+        self.bph
     }
 
     pub fn ingest_ticks(&mut self, ticks: &[TickEvent]) {
@@ -176,4 +186,70 @@ impl MetricsEngine {
 
 fn chrono_now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsp::TickEvent;
+
+    fn make_tick(index: u64, interval: f64, amplitude: f64) -> TickEvent {
+        TickEvent {
+            tick_index: index,
+            sample_index: index * 7350,
+            fractional_offset: 0.0,
+            amplitude,
+            interval,
+            timestamp: index as f64 * interval,
+        }
+    }
+
+    #[test]
+    fn test_zero_drift_produces_zero_rate() {
+        let mut engine = MetricsEngine::new("test".into(), 44100.0);
+        engine.set_bph(21600);
+
+        let nominal = 3600.0 / 21600.0;
+
+        let ticks: Vec<TickEvent> = (1..=30)
+            .map(|i| make_tick(i, nominal, 0.5))
+            .collect();
+
+        engine.ingest_ticks(&ticks);
+        let (msgs, _) = engine.drain_messages();
+
+        for msg in &msgs {
+            assert!(
+                msg.rate_spd.abs() < 0.01,
+                "tick {} rate={:.4} s/d, expected ~0 for perfect beat",
+                msg.tick_index,
+                msg.rate_spd,
+            );
+        }
+    }
+
+    #[test]
+    fn test_positive_drift_increases_rate() {
+        let mut engine = MetricsEngine::new("test".into(), 44100.0);
+        engine.set_bph(21600);
+
+        let nominal = 3600.0 / 21600.0;
+        let interval = nominal * (1.0 + 12.0 / 86400.0);
+
+        let ticks: Vec<TickEvent> = (1..=30)
+            .map(|i| make_tick(i, interval, 0.5))
+            .collect();
+
+        engine.ingest_ticks(&ticks);
+        let (msgs, _) = engine.drain_messages();
+
+        for msg in &msgs {
+            assert!(
+                msg.rate_spd > 10.0,
+                "tick {} rate={:.2} s/d, expected ~+12 s/d for +12 s/d drift",
+                msg.tick_index,
+                msg.rate_spd,
+            );
+        }
+    }
 }

@@ -811,13 +811,20 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                let new_ticks = {
+                let (new_ticks, bph_detected, detected_bph, bph_override) = {
                     let guard = state.read().await;
                     let p = guard.pipeline.lock().unwrap();
-                    p.ticks.clone()
+                    (p.ticks.clone(), p.bph_detected, p.detected_bph, guard.bph_override)
                 };
 
-                metrics.ingest_ticks(&new_ticks);
+                let bph = bph_override.unwrap_or(detected_bph);
+                if bph != metrics.bph() {
+                    metrics.set_bph(bph);
+                }
+
+                if bph_detected || bph_override.is_some() {
+                    metrics.ingest_ticks(&new_ticks);
+                }
                 let (tick_msgs, aggregate) = metrics.drain_messages();
 
                 for msg in tick_msgs {
