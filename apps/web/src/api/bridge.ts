@@ -30,10 +30,13 @@ export async function getStatus(): Promise<{
   return res.json();
 }
 
-export async function startCapture(): Promise<{ status: string; session_id: string }> {
+export async function startCapture(
+  body: { mic: { device_name?: string } } | { file: { path: string; loop_playback?: boolean } } | { simulator: { bph?: number; drift_s_per_day?: number; beat_error_ms?: number } }
+): Promise<{ status: string; session_id: string }> {
   const res = await fetch(`${baseUrl()}/start`, {
     method: 'POST',
-    headers: authHeaders(),
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`Start failed: ${res.statusText}`);
   return res.json();
@@ -59,25 +62,6 @@ export async function setParams(params: {
     body: JSON.stringify(params),
   });
   if (!res.ok) throw new Error(`Set params failed: ${res.statusText}`);
-}
-
-export async function setSource(
-  source: { type: 'mic'; device_name?: string } | { type: 'file'; path: string; loop?: boolean }
-): Promise<void> {
-  const res = await fetch(`${baseUrl()}/source`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify(source),
-  });
-  if (!res.ok) throw new Error(`Set source failed: ${res.statusText}`);
-}
-
-export async function getSource(): Promise<{
-  source: { type: 'mic'; device_name: string } | { type: 'file'; path: string; loop: boolean };
-}> {
-  const res = await fetch(`${baseUrl()}/source`, { headers: authHeaders() });
-  if (!res.ok) throw new Error(`Get source failed: ${res.statusText}`);
-  return res.json();
 }
 
 export async function listDevices(): Promise<string[]> {

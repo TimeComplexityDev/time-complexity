@@ -145,21 +145,41 @@ struct StreamQuery {
     token: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Start request — discriminated union via serde(untagged)
+// ---------------------------------------------------------------------------
+
 #[derive(Deserialize)]
-struct SetSourceRequest {
-    #[serde(rename = "type")]
-    source_type: String,
+struct MicConfig {
+    #[serde(default)]
     device_name: Option<String>,
-    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FileConfig {
+    path: String,
     #[serde(default)]
     loop_playback: bool,
 }
 
-#[derive(Clone)]
-enum SourceType {
-    None,
-    Mic(String),
-    File(String, bool),
+#[derive(Deserialize)]
+struct SimulatorConfig {
+    #[serde(default = "default_bph")]
+    bph: u16,
+    #[serde(default)]
+    drift_s_per_day: f64,
+    #[serde(default)]
+    beat_error_ms: f64,
+}
+
+fn default_bph() -> u16 { 21600 }
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StartRequest {
+    Mic { mic: MicConfig },
+    File { file: FileConfig },
+    Simulator { simulator: SimulatorConfig },
 }
 
 #[derive(Serialize, Clone)]
@@ -190,17 +210,12 @@ impl SessionState {
     }
 }
 
-struct CaptureConfig {
-    source: SourceType,
-}
-
 struct AppState {
     pair_token: String,
     device: DeviceConfig,
     session: SessionState,
     pipeline: Arc<Mutex<dsp::DspPipeline>>,
     bph_override: Option<u32>,
-    capture_config: CaptureConfig,
 }
 
 type SharedState = Arc<RwLock<AppState>>;
@@ -541,6 +556,71 @@ fn play_file(
 }
 
 // ---------------------------------------------------------------------------
+// Simulator capture
+// ---------------------------------------------------------------------------
+
+fn start_simulator_capture(
+    params: SimulatorConfig,
+    pipeline: &Arc<Mutex<dsp::DspPipeline>>,
+) -> Result<CaptureSession, String> {
+    let sample_rate = 44100;
+    let device_name = format!(
+        "simulator: {} BPH, drift {drift:+.1} s/d, beat error {be} ms",
+        params.bph,
+        drift = params.drift_s_per_day,
+        be = params.beat_error_ms,
+    );
+
+    println!("Starting simulator capture: {}", device_name);
+
+    let sample_count = Arc::new(AtomicU64::new(0));
+    let count = sample_count.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let flag = stop_flag.clone();
+    let pipe = pipeline.clone();
+    let chunk_size = 4096;
+    let sleep_dur = Duration::from_millis((chunk_size as u64 * 1000) / sample_rate as u64);
+
+    let join_handle = std::thread::spawn(move || {
+        let mut simulator = dsp::TickSimulator::new(
+            dsp::SimulatorParams {
+                bph: params.bph,
+                drift_s_per_day: params.drift_s_per_day,
+                beat_error_ms: params.beat_error_ms,
+            },
+            sample_rate,
+        );
+        let mut buf = vec![0.0_f32; chunk_size];
+
+        loop {
+            if flag.load(Ordering::Relaxed) {
+                break;
+            }
+            let written = simulator.generate_samples(&mut buf);
+            if written > 0 {
+                count.fetch_add(written as u64, Ordering::Relaxed);
+                if let Ok(mut p) = pipe.lock() {
+                    p.process_samples(&buf[..written]);
+                }
+            }
+            std::thread::sleep(sleep_dur);
+        }
+    });
+
+    let handle = FilePlayback {
+        stop_flag,
+        join_handle: Some(join_handle),
+    };
+
+    Ok(CaptureSession {
+        stream: SafeStream(Some(StreamBackend::File(handle))),
+        device_name,
+        sample_count,
+        sample_rate,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
@@ -607,6 +687,7 @@ async fn status_handler(
 
 async fn start_handler(
     State(state): State<SharedState>,
+    body: Option<Json<StartRequest>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     {
         let s = state.read().await;
@@ -618,15 +699,19 @@ async fn start_handler(
     let capture = {
         let s = state.read().await;
         let pipe = s.pipeline.clone();
-        match &s.capture_config.source {
-            SourceType::File(path, loop_playback) => {
-                start_file_capture(std::path::Path::new(path), *loop_playback, &pipe)
+
+        match body.map(|Json(b)| b) {
+            Some(StartRequest::Mic { mic }) => {
+                start_mic_capture(mic.device_name.as_ref(), &pipe).map_err(AppError::Internal)
+            }
+            Some(StartRequest::File { file }) => {
+                start_file_capture(std::path::Path::new(&file.path), file.loop_playback, &pipe)
                     .map_err(AppError::Internal)
             }
-            SourceType::Mic(device_name) => {
-                start_mic_capture(Some(device_name), &pipe).map_err(AppError::Internal)
+            Some(StartRequest::Simulator { simulator }) => {
+                start_simulator_capture(simulator, &pipe).map_err(AppError::Internal)
             }
-            SourceType::None => {
+            None => {
                 start_mic_capture(None, &pipe).map_err(AppError::Internal)
             }
         }
@@ -662,60 +747,6 @@ async fn stop_handler(
     let total = s.session.sample_count.load(Ordering::Relaxed);
     println!("Session stopped: {} total samples processed", total);
     Ok(Json(serde_json::json!({ "status": "stopped", "session_id": session_id })))
-}
-
-// ---------------------------------------------------------------------------
-// source handler
-// ---------------------------------------------------------------------------
-
-async fn source_handler(
-    State(state): State<SharedState>,
-    body: Option<Json<SetSourceRequest>>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    match body {
-        Some(Json(body)) => {
-            let source = match body.source_type.as_str() {
-                "mic" => SourceType::Mic(body.device_name.unwrap_or_default()),
-                "file" => SourceType::File(
-                    body.path.ok_or_else(|| AppError::BadRequest("path required for file source"))?,
-                    body.loop_playback,
-                ),
-                _ => return Err(AppError::BadRequest("source type must be 'mic' or 'file'")),
-            };
-            let mut s = state.write().await;
-            s.capture_config.source = source.clone();
-            let resp = match &source {
-                SourceType::Mic(name) => serde_json::json!({
-                    "status": "ok",
-                    "source": { "type": "mic", "device_name": name }
-                }),
-                SourceType::File(path, loop_playback) => serde_json::json!({
-                    "status": "ok",
-                    "source": { "type": "file", "path": path, "loop": loop_playback }
-                }),
-                SourceType::None => serde_json::json!({
-                    "status": "ok",
-                    "source": { "type": "mic", "device_name": "" }
-                }),
-            };
-            Ok(Json(resp))
-        }
-        None => {
-            let s = state.read().await;
-            let resp = match &s.capture_config.source {
-                SourceType::Mic(name) => serde_json::json!({
-                    "source": { "type": "mic", "device_name": name }
-                }),
-                SourceType::File(path, loop_playback) => serde_json::json!({
-                    "source": { "type": "file", "path": path, "loop": loop_playback }
-                }),
-                SourceType::None => serde_json::json!({
-                    "source": { "type": "mic", "device_name": "" }
-                }),
-            };
-            Ok(Json(resp))
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -846,9 +877,6 @@ async fn main() -> Result<()> {
         },
         pipeline: Arc::new(Mutex::new(dsp::DspPipeline::new(44100.0))),
         bph_override: None,
-        capture_config: CaptureConfig {
-            source: SourceType::None,
-        },
     }));
 
     let public_routes = Router::new()
@@ -857,16 +885,6 @@ async fn main() -> Result<()> {
 
     let protected_routes = Router::new()
         .route("/devices", get(devices_handler))
-        .route(
-            "/source",
-            get(|s: State<SharedState>| async { source_handler(s, None).await }),
-        )
-        .route(
-            "/source",
-            post(|s: State<SharedState>, body: Json<SetSourceRequest>| async {
-                source_handler(s, Some(body)).await
-            }),
-        )
         .route("/status", get(status_handler))
         .route("/start", post(start_handler))
         .route("/stop", post(stop_handler))

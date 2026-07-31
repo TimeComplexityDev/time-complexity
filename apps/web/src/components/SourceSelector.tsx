@@ -1,29 +1,23 @@
 import { useState, useEffect } from 'react';
-import { setSource, listDevices } from '../api/bridge';
+import { listDevices } from '../api/bridge';
 
-type SourceType = 'mic' | 'file';
+export type SourceConfig =
+  | { mic: { device_name?: string } }
+  | { file: { path: string; loop_playback?: boolean } }
+  | { simulator: { bph: number; drift_s_per_day: number; beat_error_ms: number } };
 
-interface SourceState {
-  sourceType: SourceType;
-  deviceName: string;
-  filePath: string;
-  loopPlayback: boolean;
-}
+type SourceType = 'mic' | 'file' | 'simulator';
 
 interface Props {
+  value: SourceConfig;
+  onChange: (config: SourceConfig) => void;
   disabled?: boolean;
 }
 
-export default function SourceSelector({ disabled }: Props) {
-  const [state, setState] = useState<SourceState>({
-    sourceType: 'mic',
-    deviceName: '',
-    filePath: '',
-    loopPlayback: false,
-  });
+export default function SourceSelector({ value, onChange, disabled }: Props) {
   const [devices, setDevices] = useState<string[]>([]);
-  const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+
+  const sourceType: SourceType = 'mic' in value ? 'mic' : 'file' in value ? 'file' : 'simulator';
 
   useEffect(() => {
     listDevices()
@@ -31,50 +25,40 @@ export default function SourceSelector({ disabled }: Props) {
       .catch(() => setDevices([]));
   }, []);
 
-  const handleApply = async () => {
-    setSaving(true);
-    setMessage(null);
-    try {
-      if (state.sourceType === 'mic') {
-        await setSource({ type: 'mic', device_name: state.deviceName || undefined });
-      } else {
-        await setSource({ type: 'file', path: state.filePath, loop: state.loopPlayback });
-      }
-      setMessage('Source set');
-    } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Failed to set source');
-    } finally {
-      setSaving(false);
-    }
-  };
-
   return (
     <div className="source-selector">
       <h4>Capture Source</h4>
       <div className="source-tabs">
         <button
-          className={`source-tab ${state.sourceType === 'mic' ? 'active' : ''}`}
-          onClick={() => setState((s) => ({ ...s, sourceType: 'mic' }))}
+          className={`source-tab ${sourceType === 'mic' ? 'active' : ''}`}
+          onClick={() => onChange({ mic: {} })}
           disabled={disabled}
         >
           Microphone
         </button>
         <button
-          className={`source-tab ${state.sourceType === 'file' ? 'active' : ''}`}
-          onClick={() => setState((s) => ({ ...s, sourceType: 'file' }))}
+          className={`source-tab ${sourceType === 'file' ? 'active' : ''}`}
+          onClick={() => onChange({ file: { path: '', loop_playback: false } })}
           disabled={disabled}
         >
           Audio File
         </button>
+        <button
+          className={`source-tab ${sourceType === 'simulator' ? 'active' : ''}`}
+          onClick={() => onChange({ simulator: { bph: 21600, drift_s_per_day: 0, beat_error_ms: 0 } })}
+          disabled={disabled}
+        >
+          Simulator
+        </button>
       </div>
 
       <div className="source-fields">
-        {state.sourceType === 'mic' ? (
+        {sourceType === 'mic' && (
           <div className="source-field">
             <label>Device</label>
             <select
-              value={state.deviceName}
-              onChange={(e) => setState((s) => ({ ...s, deviceName: e.target.value }))}
+              value={'mic' in value ? value.mic.device_name ?? '' : ''}
+              onChange={(e) => onChange({ mic: { device_name: e.target.value || undefined } })}
               disabled={disabled}
             >
               <option value="">Default device</option>
@@ -85,36 +69,70 @@ export default function SourceSelector({ disabled }: Props) {
               ))}
             </select>
           </div>
-        ) : (
+        )}
+
+        {sourceType === 'file' && 'file' in value && (
           <>
             <div className="source-field">
               <label>File path</label>
               <input
                 type="text"
                 placeholder="/path/to/recording.wav"
-                value={state.filePath}
-                onChange={(e) => setState((s) => ({ ...s, filePath: e.target.value }))}
+                value={value.file.path}
+                onChange={(e) => onChange({ file: { ...value.file, path: e.target.value } })}
                 disabled={disabled}
               />
             </div>
             <label className="source-checkbox">
               <input
                 type="checkbox"
-                checked={state.loopPlayback}
-                onChange={(e) => setState((s) => ({ ...s, loopPlayback: e.target.checked }))}
+                checked={value.file.loop_playback ?? false}
+                onChange={(e) => onChange({ file: { ...value.file, loop_playback: e.target.checked } })}
                 disabled={disabled}
               />
               Loop playback
             </label>
           </>
         )}
+
+        {sourceType === 'simulator' && 'simulator' in value && (
+          <>
+            <div className="source-field">
+              <label>BPH</label>
+              <input
+                type="number"
+                min={3600}
+                max={72000}
+                step={1800}
+                value={value.simulator.bph}
+                onChange={(e) => onChange({ simulator: { ...value.simulator, bph: parseInt(e.target.value, 10) || 21600 } })}
+                disabled={disabled}
+              />
+            </div>
+            <div className="source-field">
+              <label>Drift (s/day)</label>
+              <input
+                type="number"
+                step={1}
+                value={value.simulator.drift_s_per_day}
+                onChange={(e) => onChange({ simulator: { ...value.simulator, drift_s_per_day: parseFloat(e.target.value) || 0 } })}
+                disabled={disabled}
+              />
+            </div>
+            <div className="source-field">
+              <label>Beat error (ms)</label>
+              <input
+                type="number"
+                step={0.1}
+                min={0}
+                value={value.simulator.beat_error_ms}
+                onChange={(e) => onChange({ simulator: { ...value.simulator, beat_error_ms: parseFloat(e.target.value) || 0 } })}
+                disabled={disabled}
+              />
+            </div>
+          </>
+        )}
       </div>
-
-      <button className="btn-secondary btn-sm" onClick={handleApply} disabled={disabled || saving}>
-        {saving ? 'Setting...' : 'Apply Source'}
-      </button>
-
-      {message && <span className={`source-message ${message === 'Source set' ? 'success' : 'error'}`}>{message}</span>}
     </div>
   );
 }

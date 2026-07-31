@@ -352,6 +352,99 @@ impl DspPipeline {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tick simulator — generates synthetic watch tick audio on the fly
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub struct SimulatorParams {
+    pub bph: u16,
+    pub drift_s_per_day: f64,
+    pub beat_error_ms: f64,
+}
+
+impl Default for SimulatorParams {
+    fn default() -> Self {
+        SimulatorParams {
+            bph: 21600,
+            drift_s_per_day: 0.0,
+            beat_error_ms: 0.0,
+        }
+    }
+}
+
+pub struct TickSimulator {
+    sample_rate: u32,
+    current_sample: u64,
+    beat_count: u64,
+    actual_period: f64,
+    beat_error_sec: f64,
+    next_tick_sample: u64,
+    burst_remaining: usize,
+    tick_duration_samples: usize,
+}
+
+impl TickSimulator {
+    pub fn new(params: SimulatorParams, sample_rate: u32) -> Self {
+        let beats_per_sec = params.bph as f64 / 3600.0;
+        let nominal_period = 1.0 / beats_per_sec;
+        let time_scale = 1.0 + (params.drift_s_per_day / 86400.0);
+        let actual_period = nominal_period * time_scale;
+        let beat_error_sec = params.beat_error_ms / 1000.0;
+        let tick_duration_samples = (sample_rate as f64 * 0.004).round() as usize;
+
+        TickSimulator {
+            sample_rate,
+            current_sample: 0,
+            beat_count: 0,
+            actual_period,
+            beat_error_sec,
+            next_tick_sample: 0,
+            burst_remaining: 0,
+            tick_duration_samples,
+        }
+    }
+
+    pub fn next_sample(&mut self) -> Option<f32> {
+        if self.burst_remaining > 0 {
+            let burst_pos = self.tick_duration_samples - self.burst_remaining;
+            let t = burst_pos as f64 / self.sample_rate as f64;
+            let envelope = (-t * 1200.0).exp();
+            let sample = (2.0 * std::f64::consts::PI * 5000.0 * t).sin() * envelope * 0.8;
+            self.burst_remaining -= 1;
+            self.current_sample += 1;
+            return Some(sample as f32);
+        }
+
+        if self.current_sample == self.next_tick_sample {
+            // Start a new tick burst
+            self.burst_remaining = self.tick_duration_samples;
+            let interval = if self.beat_count % 2 == 0 {
+                self.actual_period + self.beat_error_sec / 2.0
+            } else {
+                self.actual_period - self.beat_error_sec / 2.0
+            };
+            self.beat_count += 1;
+            self.next_tick_sample = (self.current_sample as f64 + interval * self.sample_rate as f64).round() as u64;
+            // Recurse to emit the first sample of the burst
+            return self.next_sample();
+        }
+
+        self.current_sample += 1;
+        Some(0.0)
+    }
+
+    pub fn generate_samples(&mut self, buffer: &mut [f32]) -> usize {
+        for i in 0..buffer.len() {
+            match self.next_sample() {
+                Some(s) => buffer[i] = s,
+                None => return i,
+            }
+        }
+        buffer.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,78 +509,21 @@ mod tests {
         assert!(p.ticks.len() > 0, "expected at least 1 tick from 1s of audio, got 0");
     }
 
-    /// Generate a synthetic mechanical watch tick track.
-    ///
-    /// Simulates the acoustic impulse of an escapement at the given BPH with
-    /// optional rate drift and beat error. Each tick is a 5 kHz sine burst
-    /// with exponential decay, placed at the precise sample position given
-    /// by the drift/beat-error model.
-    ///
-    /// Parameters:
-    ///   - `bph`: beats per hour (e.g. 21600 → 6 Hz)
-    ///   - `drift_s_per_day`: rate error in seconds/day (positive = watch runs fast)
-    ///   - `beat_error_ms`: asymmetry between tic/tok in milliseconds
-    ///   - `sample_rate`: output sample rate in Hz
-    ///   - `duration_sec`: length of generated audio
-    ///   - `amplitude`: peak amplitude of each tick impulse
-    fn synthetic_click_train(
-        bph: u32,
-        drift_s_per_day: f64,
-        beat_error_ms: f64,
-        sample_rate: u32,
-        duration_sec: f64,
-        amplitude: f32,
-    ) -> Vec<f32> {
-        let total_samples = (sample_rate as f64 * duration_sec) as usize;
-        let mut audio = vec![0.0_f32; total_samples];
-
-        let beats_per_sec = bph as f64 / 3600.0;
-        let nominal_period = 1.0 / beats_per_sec;
-        let time_scale = 1.0 + (drift_s_per_day / 86400.0);
-        let actual_period = nominal_period * time_scale;
-        let beat_error_sec = beat_error_ms / 1000.0;
-
-        let mut current_time = 0.0;
-        let mut beat_count = 0u64;
-
-        while current_time < duration_sec {
-            let interval = if beat_count % 2 == 0 {
-                actual_period + beat_error_sec / 2.0
-            } else {
-                actual_period - beat_error_sec / 2.0
-            };
-
-            let sample_idx = (current_time * sample_rate as f64).round() as usize;
-            if sample_idx < total_samples {
-                let tick_dur = (sample_rate as f64 * 0.004) as usize;
-                for j in 0..tick_dur {
-                    let t = j as f64 / sample_rate as f64;
-                    let envelope = (-t * 1200.0).exp();
-                    let sample = (2.0 * std::f64::consts::PI * 5000.0 * t).sin() * envelope * amplitude as f64;
-                    let idx = sample_idx + j;
-                    if idx < total_samples {
-                        audio[idx] += sample as f32;
-                    }
-                }
-            }
-
-            current_time += interval;
-            beat_count += 1;
-        }
-
-        audio
-    }
-
     #[test]
-    fn test_synthetic_click_train_21600_bph() {
+    fn test_simulator_21600_bph() {
         let sr = 44100;
+        let mut sim = TickSimulator::new(
+            SimulatorParams { bph: 21600, drift_s_per_day: 0.0, beat_error_ms: 0.0 },
+            sr,
+        );
         let mut p = DspPipeline::new(sr as f64);
-        let samples = synthetic_click_train(21600, 0.0, 0.0, sr, 5.0, 0.5);
 
-        let total_expected = (21600.0_f64 / 3600.0 * 5.0).ceil() as usize;
+        let total_samples = (sr as f64 * 5.0) as usize;
+        let mut samples = vec![0.0f32; total_samples];
+        sim.generate_samples(&mut samples);
         p.process_samples(&samples);
 
-        // Should detect close to the expected number of ticks
+        let total_expected = (21600.0_f64 / 3600.0 * 5.0).ceil() as usize;
         let detected = p.ticks.len();
         assert!(
             (detected as isize - total_expected as isize).abs() <= 2,
@@ -496,14 +532,12 @@ mod tests {
             detected,
         );
 
-        // Detected BPH should be 21600
         assert_eq!(p.detected_bph, 21600, "BPH should be detected as 21600");
 
-        // Mean interval should be approximately 1/6 = 0.1667s
         let mean_interval: f64 = p.ticks.iter().skip(1).map(|t| t.interval).sum::<f64>()
             / (p.ticks.len().saturating_sub(1)) as f64;
         let expected_interval = 1.0 / (21600.0 / 3600.0);
-        let tolerance = expected_interval * 0.02; // 2% tolerance
+        let tolerance = expected_interval * 0.02;
         assert!(
             (mean_interval - expected_interval).abs() < tolerance,
             "mean interval {:.6}s, expected {:.6}s ± {:.6}s",
@@ -514,22 +548,26 @@ mod tests {
     }
 
     #[test]
-    fn test_synthetic_click_train_drift_detection() {
-        // 21600 BPH with +12 s/day drift should produce a measurably
-        // longer mean interval than the nominal 0.1667s.
+    fn test_simulator_drift_detection() {
         let sr = 44100;
+        let mut sim = TickSimulator::new(
+            SimulatorParams { bph: 21600, drift_s_per_day: 12.0, beat_error_ms: 0.0 },
+            sr,
+        );
         let mut p = DspPipeline::new(sr as f64);
-        let samples = synthetic_click_train(21600, 12.0, 0.0, sr, 10.0, 0.5);
+
+        let total_samples = (sr as f64 * 10.0) as usize;
+        let mut samples = vec![0.0f32; total_samples];
+        sim.generate_samples(&mut samples);
         p.process_samples(&samples);
 
-        let nominal_interval = 1.0 / (21600.0 / 3600.0); // ≈ 0.1667
+        let nominal_interval = 1.0 / (21600.0 / 3600.0);
         let detected = p.ticks.len();
         assert!(detected > 50, "should detect many ticks, got {}", detected);
 
         let mean_interval: f64 = p.ticks.iter().skip(1).map(|t| t.interval).sum::<f64>()
             / (p.ticks.len().saturating_sub(1)) as f64;
 
-        // With +12 s/day drift the interval should be slightly above nominal
         assert!(
             mean_interval > nominal_interval,
             "drift of +12 s/day should increase interval (got {:.6}s, nominal {:.6}s)",

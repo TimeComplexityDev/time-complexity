@@ -4,7 +4,7 @@ import { usePairing } from '../context/PairingContext';
 import { startCapture, stopCapture, setParams, getStatus, connectStream } from '../api/bridge';
 import TickStream from '../components/TickStream';
 import AggregateGauges from '../components/AggregateGauges';
-import SourceSelector from '../components/SourceSelector';
+import SourceSelector, { type SourceConfig } from '../components/SourceSelector';
 import type { TickEvent, AggregateUpdate, StreamMessage, Navigate } from '../types';
 
 interface Props {
@@ -21,6 +21,7 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
   const [aggregate, setAggregate] = useState<AggregateUpdate | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sourceConfig, setSourceConfig] = useState<SourceConfig>({ mic: {} });
   const wsRef = useRef<WebSocket | null>(null);
   const isRecordingRef = useRef(false);
 
@@ -57,7 +58,7 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
       if (evaluation?.bph) {
         await setParams({ bph: evaluation.bph });
       }
-      await startCapture();
+      await startCapture(sourceConfig);
       setIsRecording(true);
       isRecordingRef.current = true;
 
@@ -145,7 +146,7 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
       )}
 
       <div className="capture-view">
-        {!isRecording && <SourceSelector disabled={isRecording} />}
+        {!isRecording && <SourceSelector value={sourceConfig} onChange={setSourceConfig} disabled={isRecording} />}
 
         <AggregateGauges aggregate={aggregate} />
         <TickStream ticks={ticks} />
