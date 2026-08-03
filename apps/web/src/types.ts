@@ -55,8 +55,8 @@ export interface AggregateUpdate {
   session_id: string;
   time: string;
   instant_rate_spd: number;
-  short_avg_spd: number;
-  long_ewma_spd: number;
+  avg_rate_spd: number;
+  avg_window_s: number;
   beat_error_s: number;
   amplitude: number;
 }

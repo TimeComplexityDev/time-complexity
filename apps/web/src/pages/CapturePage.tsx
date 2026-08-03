@@ -87,7 +87,7 @@ export default function CapturePage({ readingId, evaluationId, onNavigate }: Pro
 
       if (reading && aggregate) {
         markReadingComplete(readingId, {
-          rate_spd: aggregate.long_ewma_spd,
+          rate_spd: aggregate.avg_rate_spd,
           beat_error_s: aggregate.beat_error_s,
           amplitude: aggregate.amplitude,
         });

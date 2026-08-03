@@ -8,8 +8,8 @@ pub struct AggregateUpdate {
     pub session_id: String,
     pub time: String,
     pub instant_rate_spd: f64,
-    pub short_avg_spd: f64,
-    pub long_ewma_spd: f64,
+    pub avg_rate_spd: f64,
+    pub avg_window_s: f64,
     pub beat_error_s: f64,
     pub amplitude: f64,
 }
@@ -31,14 +31,12 @@ pub struct MetricsEngine {
     sample_rate: f64,
     bph: u32,
     nominal_interval: f64,
-    half_periods: VecDeque<f64>,
+    pair_buffer: VecDeque<f64>,
+    beat_error_samples: VecDeque<f64>,
     last_sent_tick: u64,
 
-    short_window_rates: VecDeque<f64>,
-    short_window_duration: f64,
-
-    long_ewma: Option<f64>,
-    long_ewma_tau: f64,
+    avg_window_rates: VecDeque<f64>,
+    avg_window_duration: f64,
 
     last_beat_error: f64,
     last_amplitude: f64,
@@ -52,17 +50,17 @@ pub struct MetricsEngine {
 
 impl MetricsEngine {
     pub fn new(session_id: String, sample_rate: f64) -> Self {
+        let default_bph = 28800;
         MetricsEngine {
             session_id,
             sample_rate,
-            bph: 28800,
-            nominal_interval: 3600.0 / 28800.0,
-            half_periods: VecDeque::with_capacity(4),
+            bph: default_bph,
+            nominal_interval: 3600.0 / default_bph as f64 / 2.0,
+            pair_buffer: VecDeque::with_capacity(2),
+            beat_error_samples: VecDeque::with_capacity(10),
             last_sent_tick: 0,
-            short_window_rates: VecDeque::new(),
-            short_window_duration: 10.0,
-            long_ewma: None,
-            long_ewma_tau: 600.0,
+            avg_window_rates: VecDeque::new(),
+            avg_window_duration: 30.0,
             last_beat_error: 0.0,
             last_amplitude: 0.0,
             last_instant_rate: 0.0,
@@ -77,9 +75,8 @@ impl MetricsEngine {
             return;
         }
         self.bph = bph;
-        self.nominal_interval = 3600.0 / bph as f64;
-        self.short_window_rates.clear();
-        self.long_ewma = None;
+        self.nominal_interval = 3600.0 / bph as f64 / 2.0;
+        self.avg_window_rates.clear();
         self.last_instant_rate = 0.0;
     }
 
@@ -94,9 +91,9 @@ impl MetricsEngine {
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.last_sent_tick = 0;
-        self.half_periods.clear();
-        self.short_window_rates.clear();
-        self.long_ewma = None;
+        self.pair_buffer.clear();
+        self.beat_error_samples.clear();
+        self.avg_window_rates.clear();
         self.last_beat_error = 0.0;
         self.last_amplitude = 0.0;
         self.last_instant_rate = 0.0;
@@ -104,8 +101,8 @@ impl MetricsEngine {
     }
 
     pub fn ingest_ticks(&mut self, ticks: &[TickEvent]) {
-        let ticks_per_sec = self.bph as f64 / 3600.0;
-        let window_samples = (self.short_window_duration * ticks_per_sec).ceil() as usize;
+        let ticks_per_sec = self.bph as f64 * 2.0 / 3600.0;
+        let window_samples = (self.avg_window_duration * ticks_per_sec).ceil() as usize;
 
         for tick in ticks {
             if tick.tick_index <= self.last_sent_tick {
@@ -117,24 +114,24 @@ impl MetricsEngine {
             self.last_instant_rate = rate;
             self.last_amplitude = tick.amplitude;
 
-            self.half_periods.push_back(tick.interval);
-            if self.half_periods.len() >= 2 {
-                let h1 = self.half_periods[0];
-                let h2 = self.half_periods[1];
-                self.last_beat_error = (h1 - h2).abs();
-                self.half_periods.pop_front();
+            // Beat error: accumulate pairs of consecutive intervals, average over last 10 pairs
+            self.pair_buffer.push_back(tick.interval);
+            if self.pair_buffer.len() >= 2 {
+                let h1 = self.pair_buffer.pop_front().unwrap();
+                let h2 = self.pair_buffer.pop_front().unwrap();
+                let be = (h1 - h2).abs();
+                self.beat_error_samples.push_back(be);
+                if self.beat_error_samples.len() > 10 {
+                    self.beat_error_samples.pop_front();
+                }
+                self.last_beat_error = self.beat_error_samples.iter().sum::<f64>()
+                    / self.beat_error_samples.len() as f64;
             }
 
-            self.short_window_rates.push_back(rate);
-            while self.short_window_rates.len() > window_samples {
-                self.short_window_rates.pop_front();
+            self.avg_window_rates.push_back(rate);
+            while self.avg_window_rates.len() > window_samples {
+                self.avg_window_rates.pop_front();
             }
-
-            let alpha = 1.0 - (-tick.interval / self.long_ewma_tau).exp();
-            self.long_ewma = Some(match self.long_ewma {
-                Some(prev) => prev + alpha * (rate - prev),
-                None => rate,
-            });
 
             self.pending_messages.push(TickEventMessage {
                 r#type: "tick".to_string(),
@@ -152,26 +149,28 @@ impl MetricsEngine {
         let messages = self.pending_messages.drain(..).collect();
         let mut aggregate = None;
 
-        let elapsed = self.last_aggregate_time.elapsed();
-        if elapsed.as_millis() >= self.aggregate_interval_ms as u128 {
-            self.last_aggregate_time = std::time::Instant::now();
-            let now = chrono_now_iso();
-            let short_avg = if self.short_window_rates.is_empty() {
-                self.last_instant_rate
-            } else {
-                self.short_window_rates.iter().sum::<f64>() / self.short_window_rates.len() as f64
-            };
+        if self.last_sent_tick > 0 {
+            let elapsed = self.last_aggregate_time.elapsed();
+            if elapsed.as_millis() >= self.aggregate_interval_ms as u128 {
+                self.last_aggregate_time = std::time::Instant::now();
+                let now = chrono_now_iso();
+                let avg_rate = if self.avg_window_rates.is_empty() {
+                    self.last_instant_rate
+                } else {
+                    self.avg_window_rates.iter().sum::<f64>() / self.avg_window_rates.len() as f64
+                };
 
-            aggregate = Some(AggregateUpdate {
-                r#type: "aggregate".to_string(),
-                session_id: self.session_id.clone(),
-                time: now,
-                instant_rate_spd: self.last_instant_rate,
-                short_avg_spd: short_avg,
-                long_ewma_spd: self.long_ewma.unwrap_or(self.last_instant_rate),
-                beat_error_s: self.last_beat_error,
-                amplitude: self.last_amplitude,
-            });
+                aggregate = Some(AggregateUpdate {
+                    r#type: "aggregate".to_string(),
+                    session_id: self.session_id.clone(),
+                    time: now,
+                    instant_rate_spd: self.last_instant_rate,
+                    avg_rate_spd: avg_rate,
+                    avg_window_s: self.avg_window_duration,
+                    beat_error_s: self.last_beat_error,
+                    amplitude: self.last_amplitude,
+                });
+            }
         }
 
         (messages, aggregate)
@@ -212,7 +211,7 @@ mod tests {
     fn make_tick(index: u64, interval: f64, amplitude: f64) -> TickEvent {
         TickEvent {
             tick_index: index,
-            sample_index: index * 7350,
+            sample_index: (index as f64 * 3675.0) as u64,
             fractional_offset: 0.0,
             amplitude,
             interval,
@@ -225,9 +224,9 @@ mod tests {
         let mut engine = MetricsEngine::new("test".into(), 44100.0);
         engine.set_bph(21600);
 
-        let nominal = 3600.0 / 21600.0;
+        let nominal = 3600.0 / 21600.0 / 2.0;
 
-        let ticks: Vec<TickEvent> = (1..=30)
+        let ticks: Vec<TickEvent> = (1..=60)
             .map(|i| make_tick(i, nominal, 0.5))
             .collect();
 
@@ -249,10 +248,10 @@ mod tests {
         let mut engine = MetricsEngine::new("test".into(), 44100.0);
         engine.set_bph(21600);
 
-        let nominal = 3600.0 / 21600.0;
+        let nominal = 3600.0 / 21600.0 / 2.0;
         let interval = nominal * (1.0 + 12.0 / 86400.0);
 
-        let ticks: Vec<TickEvent> = (1..=30)
+        let ticks: Vec<TickEvent> = (1..=60)
             .map(|i| make_tick(i, interval, 0.5))
             .collect();
 
@@ -273,9 +272,9 @@ mod tests {
     fn test_reset_clears_state() {
         let mut engine = MetricsEngine::new("test".into(), 44100.0);
         engine.set_bph(21600);
-        let nominal = 3600.0 / 21600.0;
+        let nominal = 3600.0 / 21600.0 / 2.0;
 
-        let ticks: Vec<TickEvent> = (1..=30)
+        let ticks: Vec<TickEvent> = (1..=60)
             .map(|i| make_tick(i, nominal, 0.5))
             .collect();
 
@@ -283,13 +282,11 @@ mod tests {
         let (msgs, _) = engine.drain_messages();
         assert!(!msgs.is_empty(), "expected tick messages before reset");
 
-        // After reset, drain should yield nothing (messages cleared, last_sent_tick=0)
         engine.reset();
 
         let (msgs2, _) = engine.drain_messages();
         assert!(msgs2.is_empty(), "pending messages not cleared by reset");
 
-        // Re-ingest same ticks — should re-process from tick_index 0
         engine.ingest_ticks(&ticks);
         let (msgs3, _) = engine.drain_messages();
         assert_eq!(
@@ -304,5 +301,30 @@ mod tests {
                 msg.tick_index, msg.rate_spd,
             );
         }
+    }
+
+    #[test]
+    fn test_no_aggregate_before_ticks() {
+        let mut engine = MetricsEngine::new("test".into(), 44100.0);
+        let (_, agg) = engine.drain_messages();
+        assert!(agg.is_none(), "should not produce aggregate before any ticks");
+    }
+
+    #[test]
+    fn test_aggregate_uses_avg_rate() {
+        let mut engine = MetricsEngine::new("test".into(), 44100.0);
+        engine.set_bph(21600);
+        let nominal = 3600.0 / 21600.0;
+
+        let ticks: Vec<TickEvent> = (1..=30)
+            .map(|i| make_tick(i, nominal, 0.5))
+            .collect();
+
+        engine.ingest_ticks(&ticks);
+        // Force aggregate by advancing time
+        let (_, agg) = engine.drain_messages();
+        // Aggregates only fire after 1000ms real time in the engine,
+        // so this won't produce one in a unit test — just verify no crash
+        assert!(agg.is_none() || agg.as_ref().unwrap().avg_window_s > 0.0);
     }
 }

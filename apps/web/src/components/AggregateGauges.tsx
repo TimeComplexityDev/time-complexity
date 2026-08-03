@@ -24,12 +24,8 @@ export default function AggregateGauges({ aggregate }: Props) {
           <span className="gauge-value">{formatRate(aggregate.instant_rate_spd)}</span>
         </div>
         <div className="gauge">
-          <span className="gauge-label">Short Avg</span>
-          <span className="gauge-value">{formatRate(aggregate.short_avg_spd)}</span>
-        </div>
-        <div className="gauge">
-          <span className="gauge-label">Long EWMA</span>
-          <span className="gauge-value">{formatRate(aggregate.long_ewma_spd)}</span>
+          <span className="gauge-label">Avg ({aggregate.avg_window_s}s)</span>
+          <span className="gauge-value">{formatRate(aggregate.avg_rate_spd)}</span>
         </div>
         <div className="gauge">
           <span className="gauge-label">Beat Error</span>

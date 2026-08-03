@@ -14,12 +14,12 @@ This directory contains the local macOS bridge binary for audio capture and DSP.
 
 - **Matched filter**: Time-reversed template used for tick detection (deferred — MVP uses envelope detection).
 - **Parabolic interpolation**: Sub-sample peak timing estimation.
-- **Nominal interval**: `3600 / BPH`, the expected half-period duration.
-- **BPH**: Beats per hour (e.g., 28800, 21600). Auto-detected from observed intervals, with manual override available.
-- **Refractory period**: Minimum gap between detected ticks (`0.25 × nominal_half_period`).
+- **Half-period**: `1800 / BPH`, the time between consecutive ticks (tic→tok or tok→tic). Each beat produces two ticks.
+- **BPH**: Beats per hour (e.g., 28800, 21600). Auto-detected from observed half-period intervals, with manual override available.
+- **Refractory period**: Minimum gap between detected ticks (`0.25 × half-period`).
 - **Adaptive threshold**: Two thresholds derived from observed tic/tok amplitudes — one for each half-period direction.
-- **Short window**: 1–30 s moving average.
-- **Long EWMA**: Exponentially weighted moving average (default tau 600 s).
+- **Average window**: 30 s rolling average of tick rates.
+- **Beat error**: `|tic_interval - tok_interval|`, averaged over the last 10 consecutive pairs. Reported in seconds.
 
 ## Interfaces
 

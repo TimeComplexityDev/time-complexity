@@ -219,6 +219,7 @@ pub struct DspPipeline {
     samples_since_peak: usize,
     peak_count: u64,
     last_peak_sample: u64,
+    last_frac: f64,
 
     /// Observed intervals for BPH auto-detect (capped at 10)
     interval_history: VecDeque<f64>,
@@ -248,6 +249,7 @@ impl DspPipeline {
             samples_since_peak: usize::MAX,
             peak_count: 0,
             last_peak_sample: 0,
+            last_frac: 0.0,
             interval_history: VecDeque::with_capacity(10),
             detected_bph: DEFAULT_BPH,
             bph_detected: false,
@@ -257,8 +259,8 @@ impl DspPipeline {
 
     fn compute_refractory(sample_rate: f64) -> usize {
         let nominal_bph = DEFAULT_BPH as f64;
-        let nominal_half_period = 3600.0 / nominal_bph;
-        (REFRACTORY_FRACTION * nominal_half_period * sample_rate) as usize
+        let half_period = 3600.0 / nominal_bph / 2.0;
+        (REFRACTORY_FRACTION * half_period * sample_rate) as usize
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: f64) {
@@ -287,6 +289,7 @@ impl DspPipeline {
         self.samples_since_peak = usize::MAX;
         self.peak_count = 0;
         self.last_peak_sample = 0;
+        self.last_frac = 0.0;
         self.interval_history.clear();
         self.detected_bph = DEFAULT_BPH;
         self.bph_detected = false;
@@ -327,13 +330,16 @@ impl DspPipeline {
             );
 
             let interval = if self.peak_count > 0 {
-                (idx as f64 - self.last_peak_sample as f64) / self.sample_rate
+                let curr_pos = idx as f64 + frac;
+                let prev_pos = self.last_peak_sample as f64 + self.last_frac;
+                (curr_pos - prev_pos) / self.sample_rate
             } else {
                 0.0
             };
 
             self.peak_count += 1;
             self.last_peak_sample = idx;
+            self.last_frac = frac;
 
             if interval > 0.0 {
                 self.interval_history.push_back(interval);
@@ -342,17 +348,18 @@ impl DspPipeline {
                 }
             }
 
-            // Auto-detect BPH from first 10 intervals
+            // Auto-detect BPH from first 10 intervals (half-periods)
             if self.peak_count == 10 {
                 let avg_interval: f64 = self.interval_history.iter().sum::<f64>()
                     / self.interval_history.len() as f64;
+                // Double half-period to full period for BPH calculation
                 self.detected_bph = nearest_bph(
-                    avg_interval * self.sample_rate,
+                    avg_interval * self.sample_rate * 2.0,
                     self.sample_rate,
                 );
                 self.bph_detected = true;
                 // Update refractory period to match detected BPH
-                let half_period = 3600.0 / self.detected_bph as f64;
+                let half_period = 3600.0 / self.detected_bph as f64 / 2.0;
                 self.refractory_samples = (REFRACTORY_FRACTION * half_period * self.sample_rate).max(1.0) as usize;
             }
 
@@ -399,7 +406,7 @@ pub struct TickSimulator {
     beat_count: u64,
     actual_period: f64,
     beat_error_sec: f64,
-    next_tick_sample: u64,
+    next_tick_exact: f64,
     burst_remaining: usize,
     tick_duration_samples: usize,
 }
@@ -407,9 +414,9 @@ pub struct TickSimulator {
 impl TickSimulator {
     pub fn new(params: SimulatorParams, sample_rate: u32) -> Self {
         let beats_per_sec = params.bph as f64 / 3600.0;
-        let nominal_period = 1.0 / beats_per_sec;
+        let nominal_half_period = 1.0 / beats_per_sec / 2.0;
         let time_scale = 1.0 + (params.drift_s_per_day / 86400.0);
-        let actual_period = nominal_period * time_scale;
+        let actual_half_period = nominal_half_period * time_scale;
         let beat_error_sec = params.beat_error_ms / 1000.0;
         let tick_duration_samples = (sample_rate as f64 * 0.004).round() as usize;
 
@@ -417,9 +424,9 @@ impl TickSimulator {
             sample_rate,
             current_sample: 0,
             beat_count: 0,
-            actual_period,
+            actual_period: actual_half_period,
             beat_error_sec,
-            next_tick_sample: 0,
+            next_tick_exact: 0.0,
             burst_remaining: 0,
             tick_duration_samples,
         }
@@ -436,8 +443,7 @@ impl TickSimulator {
             return Some(sample as f32);
         }
 
-        if self.current_sample == self.next_tick_sample {
-            // Start a new tick burst
+        if (self.current_sample as f64) >= self.next_tick_exact.round() {
             self.burst_remaining = self.tick_duration_samples;
             let interval = if self.beat_count % 2 == 0 {
                 self.actual_period + self.beat_error_sec / 2.0
@@ -445,8 +451,7 @@ impl TickSimulator {
                 self.actual_period - self.beat_error_sec / 2.0
             };
             self.beat_count += 1;
-            self.next_tick_sample = (self.current_sample as f64 + interval * self.sample_rate as f64).round() as u64;
-            // Recurse to emit the first sample of the burst
+            self.next_tick_exact += interval * self.sample_rate as f64;
             return self.next_sample();
         }
 
@@ -544,7 +549,7 @@ mod tests {
         sim.generate_samples(&mut samples);
         p.process_samples(&samples);
 
-        let total_expected = (21600.0_f64 / 3600.0 * 5.0).ceil() as usize;
+        let total_expected = (21600.0_f64 / 3600.0 * 2.0 * 5.0).ceil() as usize;
         let detected = p.ticks.len();
         assert!(
             (detected as isize - total_expected as isize).abs() <= 2,
@@ -570,7 +575,7 @@ mod tests {
         sim.generate_samples(&mut samples);
         p.process_samples(&samples);
 
-        let nominal_interval = 1.0 / (21600.0 / 3600.0);
+        let nominal_interval = 1.0 / (21600.0 / 3600.0) / 2.0;
 
         for tick in p.ticks.iter().skip(1) {
             let rate_spd = (tick.interval - nominal_interval) / nominal_interval * 86400.0;
@@ -599,9 +604,9 @@ mod tests {
         sim.generate_samples(&mut samples);
         p.process_samples(&samples);
 
-        assert!(p.ticks.len() >= 35, "expected at least 35 ticks for 28800 BPH @ 5s");
+        assert!(p.ticks.len() >= 70, "expected at least 70 ticks for 28800 BPH @ 5s");
 
-        let nominal_interval = 1.0 / (28800.0 / 3600.0);
+        let nominal_interval = 1.0 / (28800.0 / 3600.0) / 2.0;
 
         for tick in p.ticks.iter().skip(1) {
             let rate_spd = (tick.interval - nominal_interval) / nominal_interval * 86400.0;
@@ -629,9 +634,9 @@ mod tests {
         sim.generate_samples(&mut samples);
         p.process_samples(&samples);
 
-        let nominal_interval = 1.0 / (21600.0 / 3600.0);
+        let nominal_interval = 1.0 / (21600.0 / 3600.0) / 2.0;
         let detected = p.ticks.len();
-        assert!(detected > 50, "should detect many ticks, got {}", detected);
+        assert!(detected > 100, "should detect many ticks, got {}", detected);
 
         let mean_interval: f64 = p.ticks.iter().skip(1).map(|t| t.interval).sum::<f64>()
             / (p.ticks.len().saturating_sub(1)) as f64;
@@ -655,16 +660,15 @@ mod tests {
     // Helpers for comprehensive integration tests
     // -----------------------------------------------------------------------
 
-    /// Pick a sample rate where `sr / (bph/3600)` is an integer, so the
-    /// simulator produces zero-jitter ticks (exact sample positions).
+    /// Pick a sample rate where the half-period in samples is an integer.
     fn compatible_sr(bph: u16) -> u32 {
         match bph {
-            18000 => 44100,  // 44100/5 = 8820
-            19800 => 44000,  // 44000/5.5 = 8000
-            21600 => 44100,  // 44100/6 = 7350
-            25200 => 44100,  // 44100/7 = 6300
-            28800 => 48000,  // 48000/8 = 6000
-            36000 => 44100,  // 44100/10 = 4410
+            18000 => 44100,  // 44100/10 = 4410 samples/half-period
+            19800 => 44000,  // 44000/11 = 4000 samples/half-period
+            21600 => 44100,  // 44100/12 = 3675 samples/half-period
+            25200 => 44100,  // 44100/14 = 3150 samples/half-period
+            28800 => 48000,  // 48000/16 = 3000 samples/half-period
+            36000 => 44100,  // 44100/20 = 2205 samples/half-period
             _ => 44100,
         }
     }
@@ -737,7 +741,7 @@ mod tests {
         for &bph in &[18000u16, 19800, 21600, 25200, 28800, 36000] {
             let sr = compatible_sr(bph);
             let result = run_simulation(bph, 0.0, 0.0, sr, 5.0);
-            let nominal = 3600.0 / bph as f64;
+            let nominal = 3600.0 / bph as f64 / 2.0;
 
             for tick in result.ticks.iter().skip(1) {
                 let rate = (tick.interval - nominal) / nominal * 86400.0;
@@ -772,8 +776,8 @@ mod tests {
                 36000 => 96000u32,  // 96000/10 = 9600 samples/tick
                 _ => 96000,
             };
-            let nominal = 3600.0 / bph as f64;
-            let samples_per_tick = sr as f64 / (bph as f64 / 3600.0);
+            let nominal = 3600.0 / bph as f64 / 2.0;
+            let samples_per_tick = sr as f64 / (bph as f64 / 3600.0) / 2.0;
 
             for &(drift_spd, base_tol) in drifts {
                 let result = run_simulation(bph, drift_spd, 0.0, sr, 8.0);
@@ -862,7 +866,7 @@ mod tests {
 
         assert_eq!(p.detected_bph, 21600);
         assert!(p.bph_detected);
-        assert!(p.ticks.len() >= 25);
+        assert!(p.ticks.len() >= 50);
 
         // Reset — as if user started a new measurement
         p.reset();
@@ -887,7 +891,7 @@ mod tests {
         );
         assert!(p.bph_detected);
 
-        let nominal = 3600.0 / 28800.0;
+        let nominal = 3600.0 / 28800.0 / 2.0;
         let mean_interval: f64 = p.ticks.iter().skip(1).map(|t| t.interval).sum::<f64>()
             / (p.ticks.len().saturating_sub(1)) as f64;
         let mean_rate = (mean_interval - nominal) / nominal * 86400.0;
@@ -921,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_full_pipeline_drift_through_metrics_engine() {
-        let result = run_simulation_with_metrics(21600, 8.0, 0.0, 44100, 10.0);
+        let result = run_simulation_with_metrics(21600, 8.0, 0.0, 96000, 10.0);
 
         assert!(!result.tick_msgs.is_empty(), "should produce tick messages");
 
